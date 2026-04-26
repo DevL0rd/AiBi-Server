@@ -3,7 +3,7 @@
     {
       "id": "ability_alarm_set",
       "description": "Set or manage an alarm.",
-      "instructions": "Use time as 24-hour HH:mm for a specific alarm time. Official passthrough used tag=0 for default alarms. Firmware category strings indicate tags for default, pill, water, exercise, getup, feed, and meeting alarms.",
+      "instructions": "Use time as 24-hour HH:mm. Use tag: 0=default, 1=pill, 2=water, 3=exercise, 4=getup, 5=feed, 6=meeting.",
       "valid_params": {
         "time": "HH:mm",
         "tag": [
@@ -245,7 +245,7 @@
     },
     {
       "id": "function_update",
-      "description": "Check or start firmware update.",
+      "description": "Check or start update.",
       "instructions": "Use type=check for update checks and type=start for start/install update.",
       "valid_params": {
         "type": [
@@ -283,7 +283,7 @@
     {
       "id": "interact_food_feed",
       "description": "Feed/eat behavior. If the user says they gave you one of the valid items, or is feeding you, use this.",
-      "instructions": "Use for feeding AIBI or food play. Firmware food handling uses the feed path with an index parameter. Food item order from firmware strings: 1=starcandy, 2=doughnut, 3=jelly, 4=cottoncandy, 5=cookie, 6=mushroom, 7=bigmushrooms, 8=cola, 9=popsicle, 10=strawberry, 11=carrot, 12=fish.",
+      "instructions": "Use for feeding AIBI or food play. Use index: 1=starcandy, 2=doughnut, 3=jelly, 4=cottoncandy, 5=cookie, 6=mushroom, 7=bigmushrooms, 8=cola, 9=popsicle, 10=strawberry, 11=carrot, 12=fish.",
       "valid_params": {
         "index": "number 1-12"
       }
@@ -324,6 +324,14 @@
       "description": "Identify or inspect behavior.",
       "instructions": "Use only for AIBI's native identify/self-identify behavior. Do not use for camera, image, photo, look, see, or object-recognition requests; those should use recognition_enabled.",
       "valid_params": {}
+    },
+    {
+      "id": "interact_answer_with_animation",
+      "description": "Answer with a animation.",
+      "instructions": "Use only when a response should be expressed by playing a specific known animation instead of normal speech.",
+      "valid_params": {
+        "animation_name": "string"
+      }
     },
     {
       "id": "interact_mood",
