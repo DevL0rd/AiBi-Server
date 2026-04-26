@@ -1,0 +1,33 @@
+{
+  "name": "aibi-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron console and local service replacement for AiBi robot traffic",
+  "type": "module",
+  "main": "electron/main.js",
+  "scripts": {
+    "proxy": "node proxy.js",
+    "prestart": "pkill -f '[e]lectron \\\\.|[n]ode proxy.js' || true",
+    "start": "electron .",
+    "dev": "vite --host 127.0.0.1",
+    "electron": "electron .",
+    "build": "vite build",
+    "allow-low-ports": "sudo setcap cap_net_bind_service=+ep /usr/bin/node",
+    "check-low-ports": "getcap /usr/bin/node node_modules/electron/dist/electron",
+    "check": "node --check proxy.js && node --check electron/main.js && node --check electron/preload.js && node --check scripts/find-latest-firmware.mjs && node --check scripts/decompile-firmware.mjs && node --check scripts/rebuild-firmware.mjs && node --check scripts/patch-firmware.mjs",
+    "firmware:latest": "node scripts/find-latest-firmware.mjs",
+    "firmware:rebuild": "node scripts/rebuild-firmware.mjs",
+    "firmware:patch": "node scripts/patch-firmware.mjs"
+  },
+  "dependencies": {
+    "@openrouter/sdk": "0.12.21",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "39.8.9",
+    "fish-audio": "0.1.0",
+    "lucide-react": "0.561.0",
+    "vite": "7.3.2",
+    "react": "19.2.5",
+    "react-dom": "19.2.5"
+  },
+  "devDependencies": {}
+}

@@ -1,0 +1,22 @@
+node_modules/
+dist/
+
+# Runtime data
+aibi.sqlite
+aibi.sqlite-*
+captures/
+logs/
+tts/
+
+# Local certificates and network config
+aibi.key
+aibi.crt
+*.pem
+dnsmasq-aibi.conf
+
+# Local/editor noise
+.env
+.env.*
+.DS_Store
+.codex
+npm-debug.log*
