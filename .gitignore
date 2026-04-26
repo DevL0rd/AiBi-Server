@@ -8,12 +8,6 @@ captures/
 logs/
 tts/
 
-# Local certificates and network config
-aibi.key
-aibi.crt
-*.pem
-dnsmasq-aibi.conf
-
 # Local/editor noise
 .env
 .env.*
