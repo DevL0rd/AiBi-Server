@@ -1138,17 +1138,20 @@ function ModelPicker({ open, onOpenChange, models, selected, onSelect, onRefresh
   const [filters, setFilters] = useState({ audio: false, image: false, reasoning: false, free: false });
   const [sortBy, setSortBy] = useState("newest");
   const filteredModels = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const terms = tokenizeSearch(query);
     return models
       .filter((model) => {
-        if (needle && !modelSearchText(model).includes(needle)) return false;
         if (filters.audio && !supportsModelInput(model, "audio")) return false;
         if (filters.image && !supportsModelInput(model, "image")) return false;
         if (filters.reasoning && !supportsModelParameter(model, "reasoning")) return false;
         if (filters.free && !modelIsFree(model)) return false;
+        if (terms.length && scoreModelSearch(model, terms) <= 0) return false;
         return true;
       })
-      .sort((a, b) => compareModels(a, b, sortBy))
+      .sort((a, b) => {
+        if (terms.length) return scoreModelSearch(b, terms) - scoreModelSearch(a, terms) || compareModels(a, b, sortBy);
+        return compareModels(a, b, sortBy);
+      })
       .slice(0, 120);
   }, [models, query, filters, sortBy]);
 
@@ -1262,19 +1265,63 @@ function ModelBadge({ icon, children }) {
   );
 }
 
-function modelSearchText(model) {
-  return [
-    model.id,
-    model.name,
-    model.provider,
-    model.description,
-    formatModelCost(model),
-    formatModelModalities(model),
-    modelCreatedLabel(model),
-    supportsModelInput(model, "audio") ? "voice audio microphone speech input" : "",
-    supportsModelInput(model, "image") ? "image vision recognition photo camera" : "",
-    supportsModelParameter(model, "reasoning") ? "thinking reasoning effort" : "",
-  ].join(" ").toLowerCase();
+function tokenizeSearch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .split(/[^a-z0-9.]+/g)
+    .map((term) => term.trim())
+    .filter(Boolean);
+}
+
+function scoreModelSearch(model, terms) {
+  const fields = [
+    { value: model.id, weight: 18 },
+    { value: model.name, weight: 16 },
+    { value: model.provider, weight: 10 },
+    { value: model.description, weight: 2 },
+    { value: formatModelCost(model), weight: 4 },
+    { value: formatModelModalities(model), weight: 4 },
+    { value: modelCreatedLabel(model), weight: 2 },
+    { value: supportsModelInput(model, "audio") ? "voice audio microphone speech input" : "", weight: 8 },
+    { value: supportsModelInput(model, "image") ? "image vision recognition photo camera" : "", weight: 8 },
+    { value: supportsModelParameter(model, "reasoning") ? "thinking reasoning effort" : "", weight: 8 },
+  ].map((field) => ({ ...field, value: normalizeSearch(field.value) }));
+
+  let total = 0;
+  for (const term of terms) {
+    const normalizedTerm = normalizeSearch(term);
+    const best = Math.max(...fields.map((field) => scoreSearchField(field.value, normalizedTerm) * field.weight));
+    if (best <= 0) return 0;
+    total += best;
+  }
+  return total;
+}
+
+function normalizeSearch(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function scoreSearchField(field, term) {
+  if (!field || !term) return 0;
+  const compactField = field.replace(/\s+/g, "");
+  const compactTerm = term.replace(/\s+/g, "");
+  const words = field.split(/\s+/g).filter(Boolean);
+  if (field === term || compactField === compactTerm) return 10;
+  if (words.some((word) => word === term)) return 8;
+  if (words.some((word) => word.startsWith(term))) return 6;
+  if (field.includes(term) || compactField.includes(compactTerm)) return 4;
+  if (isSubsequence(compactTerm, compactField)) return Math.max(1, 3 - compactTerm.length / 12);
+  return 0;
+}
+
+function isSubsequence(needle, haystack) {
+  if (!needle || !haystack) return false;
+  let index = 0;
+  for (const char of haystack) {
+    if (char === needle[index]) index += 1;
+    if (index === needle.length) return true;
+  }
+  return false;
 }
 
 function supportsModelInput(model, modality) {

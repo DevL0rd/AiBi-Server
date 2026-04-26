@@ -9,6 +9,7 @@ const DEFAULT_DISABLED_ANIMATION_IDS = (capabilities.animations || [])
   .map((animation) => typeof animation === "string" ? animation : animation?.id)
   .filter(Boolean)
   .map(String);
+const DEFAULT_DISABLED_CAPABILITY_IDS = ["interact_answer_with_animation", "interact_mood", "interact_greeting"];
 
 const DEFAULT_SETTINGS = {
   mode: "local",
@@ -26,7 +27,7 @@ const DEFAULT_SETTINGS = {
   personalityPrompt: "You are AIBI: warm, curious, playful, and concise. You feel like a small embodied desktop companion, not a generic assistant.",
   localTextFallback: "A error has occured.",
   actionAfterSpeech: false,
-  disabledCapabilityIds: ["interact_answer_with_animation", "interact_mood", "interact_greeting"],
+  disabledCapabilityIds: DEFAULT_DISABLED_CAPABILITY_IDS,
   disabledAnimationIds: DEFAULT_DISABLED_ANIMATION_IDS,
 };
 
@@ -108,7 +109,7 @@ export class AppStore {
 
   migrateDefaultDisabledCapabilities(settings) {
     const disabledCapabilityIds = new Set(settings.disabledCapabilityIds || []);
-    disabledCapabilityIds.add("interact_answer_with_animation");
+    for (const id of DEFAULT_DISABLED_CAPABILITY_IDS) disabledCapabilityIds.add(id);
     if (disabledCapabilityIds.size !== (settings.disabledCapabilityIds || []).length) {
       this.setSetting("disabledCapabilityIds", [...disabledCapabilityIds].sort());
     }
