@@ -21,7 +21,7 @@ Local runtime files are intentionally ignored:
 - `aibi.sqlite*`
 - `firmware/`
 - `logs/`
-- `tts/`
+- `chat-media/`
 
 ## Notes
 

@@ -7,7 +7,6 @@ aibi.sqlite
 aibi.sqlite-*
 firmware/
 logs/
-tts/
 chat-media/
 
 # Local/editor noise

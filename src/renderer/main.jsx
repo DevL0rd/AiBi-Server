@@ -9,6 +9,9 @@ import {
   ChevronRight,
   Clock3,
   Cpu,
+  Filter,
+  Globe,
+  Image,
   KeyRound,
   ListChecks,
   MessageCircle,
@@ -22,6 +25,7 @@ import {
   Save,
   Search,
   Settings,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Terminal,
@@ -576,7 +580,7 @@ function ChatLogView({ messages, clearChatLog, updateChatMessage, deleteChatMess
 function ChatMessageRow({ message, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content || "");
-  const media = message.payload?.media || [];
+  const media = (message.payload?.media || []).filter((item) => item.type === "image");
 
   useEffect(() => {
     if (!editing) setDraft(message.content || "");
@@ -670,8 +674,6 @@ function ChatMedia({ media }) {
         <div className="text-xs text-muted-foreground">Loading media...</div>
       ) : media.type === "image" ? (
         <img className="max-h-72 w-full rounded-md object-contain" src={source} alt={media.label || "chat image"} />
-      ) : media.type === "audio" ? (
-        <audio className="w-full" controls src={source} />
       ) : (
         <a className="text-xs text-cyan-300 underline" href={source}>Open media</a>
       )}
@@ -880,6 +882,45 @@ function SettingsView({ draft, updateSetting, saveState, models, setModels }) {
                 onChange={(v) => updateSetting("openRouterApiKey", v)}
                 password
               />
+              <div className="grid gap-3 md:grid-cols-2">
+                <SwitchSetting
+                  icon={<Globe />}
+                  label="Internet Access"
+                  checked={Boolean(draft.openRouterWebSearchEnabled)}
+                  onChange={(v) => updateSetting("openRouterWebSearchEnabled", v)}
+                />
+                <SwitchSetting
+                  icon={<BrainCircuit />}
+                  label="Thinking"
+                  checked={Boolean(draft.openRouterReasoningEnabled)}
+                  onChange={(v) => updateSetting("openRouterReasoningEnabled", v)}
+                />
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <ReasoningEffortField
+                  value={draft.openRouterReasoningEffort || "medium"}
+                  onChange={(v) => updateSetting("openRouterReasoningEffort", v)}
+                  disabled={!draft.openRouterReasoningEnabled}
+                />
+                <NumberSetting
+                  icon={<SlidersHorizontal />}
+                  label="Temperature"
+                  value={draft.openRouterTemperature ?? 0.7}
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  onChange={(v) => updateSetting("openRouterTemperature", v)}
+                />
+                <NumberSetting
+                  icon={<Cpu />}
+                  label="Max Output Tokens"
+                  value={draft.openRouterMaxTokens ?? 900}
+                  min={64}
+                  max={12000}
+                  step={64}
+                  onChange={(v) => updateSetting("openRouterMaxTokens", v)}
+                />
+              </div>
             </SettingsSection>
 
             <SettingsSection
@@ -1030,6 +1071,31 @@ function TextareaSetting({ icon, label, value, onChange }) {
   );
 }
 
+function NumberSetting({ icon, label, value, min, max, step, onChange }) {
+  const numberValue = Number(value);
+  const safeValue = Number.isFinite(numberValue) ? numberValue : min;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label>{React.cloneElement(icon, { className: "size-4" })} {label}</Label>
+        <Badge variant="secondary">{safeValue}</Badge>
+      </div>
+      <div className="rounded-xl border border-border bg-background px-3 py-2">
+        <input
+          type="range"
+          className="w-full accent-cyan-300"
+          min={min}
+          max={max}
+          step={step}
+          value={safeValue}
+          onChange={(event) => onChange(Number(event.target.value))}
+        />
+        <div className="mt-1 h-[15px]" aria-hidden="true" />
+      </div>
+    </div>
+  );
+}
+
 function SwitchSetting({ icon, label, checked, onChange }) {
   return (
     <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-background p-3">
@@ -1039,24 +1105,65 @@ function SwitchSetting({ icon, label, checked, onChange }) {
   );
 }
 
+function ReasoningEffortField({ value, onChange, disabled }) {
+  const efforts = ["minimal", "low", "medium", "high"];
+  const index = Math.max(0, efforts.indexOf(value));
+  return (
+    <div className={cn("space-y-2", disabled && "opacity-50")}>
+      <div className="flex items-center justify-between gap-2">
+        <Label><BrainCircuit className="size-4" /> Reasoning Effort</Label>
+        <Badge variant="secondary" className="capitalize">{efforts[index]}</Badge>
+      </div>
+      <div className="rounded-xl border border-border bg-background px-3 py-2">
+        <input
+          type="range"
+          className="w-full accent-cyan-300"
+          min={0}
+          max={efforts.length - 1}
+          step={1}
+          value={index}
+          disabled={disabled}
+          onChange={(event) => onChange(efforts[Number(event.target.value)])}
+        />
+        <div className="mt-1 grid grid-cols-4 text-center text-[10px] text-muted-foreground">
+          {efforts.map((effort) => <span key={effort} className="capitalize">{effort}</span>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ModelPicker({ open, onOpenChange, models, selected, onSelect, onRefresh, refreshing }) {
   const [query, setQuery] = useState("");
+  const [filters, setFilters] = useState({ audio: false, image: false, reasoning: false, free: false });
+  const [sortBy, setSortBy] = useState("newest");
   const filteredModels = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return models.slice(0, 120);
     return models
-      .filter((model) => `${model.id} ${model.name} ${model.provider} ${model.description}`.toLowerCase().includes(needle))
+      .filter((model) => {
+        if (needle && !modelSearchText(model).includes(needle)) return false;
+        if (filters.audio && !supportsModelInput(model, "audio")) return false;
+        if (filters.image && !supportsModelInput(model, "image")) return false;
+        if (filters.reasoning && !supportsModelParameter(model, "reasoning")) return false;
+        if (filters.free && !modelIsFree(model)) return false;
+        return true;
+      })
+      .sort((a, b) => compareModels(a, b, sortBy))
       .slice(0, 120);
-  }, [models, query]);
+  }, [models, query, filters, sortBy]);
+
+  function toggleFilter(key) {
+    setFilters((current) => ({ ...current, [key]: !current[key] }));
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl overflow-hidden p-0" showCloseButton>
-        <DialogHeader className="border-b border-border p-4 pb-3">
-          <div className="flex items-start justify-between gap-4">
+      <DialogContent className="!h-[min(760px,78vh)] !w-[min(1180px,86vw)] !max-w-none grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0" showCloseButton>
+        <DialogHeader className="border-b border-border bg-card p-4 pb-3">
+          <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <DialogTitle>Choose Model</DialogTitle>
-              <DialogDescription>{models.length} models synced from OpenRouter</DialogDescription>
+              <DialogDescription>{filteredModels.length} shown from {models.length} synced OpenRouter models</DialogDescription>
             </div>
             <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
               <RefreshCw className={cn(refreshing && "animate-spin")} />
@@ -1064,28 +1171,63 @@ function ModelPicker({ open, onOpenChange, models, selected, onSelect, onRefresh
             </Button>
           </div>
         </DialogHeader>
-        <Command className="rounded-none" shouldFilter={false}>
-          <CommandInput value={query} onValueChange={setQuery} placeholder="Search models" />
-          <CommandList className="max-h-[520px]">
+        <Command className="min-h-0 rounded-none bg-background" shouldFilter={false}>
+          <div className="border-b border-border bg-card/60 p-3">
+            <CommandInput value={query} onValueChange={setQuery} placeholder="Search by model, provider, cost, voice, image, or thinking" />
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="flex items-center gap-1 text-xs text-muted-foreground"><Filter className="size-3.5" /> Filters</span>
+              <FilterButton active={filters.audio} onClick={() => toggleFilter("audio")} icon={<Mic />}>Audio</FilterButton>
+              <FilterButton active={filters.image} onClick={() => toggleFilter("image")} icon={<Image />}>Image</FilterButton>
+              <FilterButton active={filters.reasoning} onClick={() => toggleFilter("reasoning")} icon={<BrainCircuit />}>Thinking</FilterButton>
+              <FilterButton active={filters.free} onClick={() => toggleFilter("free")} icon={<Sparkles />}>Free</FilterButton>
+              <div className="ml-auto flex items-center gap-2">
+                <Label className="text-xs text-muted-foreground">Sort</Label>
+                <select
+                  className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none"
+                  value={sortBy}
+                  onChange={(event) => setSortBy(event.target.value)}
+                >
+                  <option value="newest">Newest</option>
+                  <option value="cheapest">Cheapest</option>
+                  <option value="context">Largest Context</option>
+                  <option value="name">Name</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <CommandList className="min-h-0 flex-1 max-h-none">
             <CommandEmpty>No matching models.</CommandEmpty>
-            <CommandGroup>
+            <CommandGroup className="grid grid-cols-1 gap-2 p-3 xl:grid-cols-2">
               {filteredModels.map((model) => (
                 <CommandItem
                   key={model.id}
                   value={`${model.id} ${model.name} ${model.provider} ${model.description}`}
                   data-checked={selected === model.id}
                   onSelect={() => onSelect(model.id)}
-                  className="items-start gap-3 py-2"
+                  className="items-stretch gap-3 rounded-lg border border-border bg-card px-3 py-3 data-[checked=true]:border-cyan-400/50 data-[checked=true]:bg-cyan-400/10"
                 >
-                  <BrainCircuit className="mt-0.5 size-4 text-muted-foreground" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-medium">{model.name}</span>
-                    <span className="block truncate text-xs text-muted-foreground">{model.id}</span>
-                  </span>
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {model.contextLength ? `${model.contextLength.toLocaleString()} ctx` : "ctx unknown"}
-                  </span>
-                  {selected === model.id && <Check className="mt-0.5 size-4 text-cyan-300" />}
+                  <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-md border border-border bg-card">
+                    <BrainCircuit className="size-4 text-cyan-200" />
+                  </div>
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <div className="flex min-w-0 items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium">{model.name}</div>
+                        <div className="truncate font-mono text-xs text-muted-foreground">{model.id}</div>
+                      </div>
+                      {selected === model.id && <Check className="mt-0.5 size-4 shrink-0 text-cyan-300" />}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <ModelBadge>{model.provider || "provider"}</ModelBadge>
+                      <ModelBadge>{model.contextLength ? `${model.contextLength.toLocaleString()} ctx` : "ctx unknown"}</ModelBadge>
+                      <ModelBadge>{formatModelCost(model)}</ModelBadge>
+                      {modelCreatedLabel(model) && <ModelBadge>{modelCreatedLabel(model)}</ModelBadge>}
+                      {supportsModelInput(model, "audio") && <ModelBadge icon={<Mic />}>audio</ModelBadge>}
+                      {supportsModelInput(model, "image") && <ModelBadge icon={<Image />}>image</ModelBadge>}
+                      {supportsModelParameter(model, "reasoning") && <ModelBadge icon={<BrainCircuit />}>thinking</ModelBadge>}
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">{formatModelModalities(model)}</div>
+                  </div>
                 </CommandItem>
               ))}
             </CommandGroup>
@@ -1095,6 +1237,110 @@ function ModelPicker({ open, onOpenChange, models, selected, onSelect, onRefresh
     </Dialog>
   );
 }
+
+function FilterButton({ active, onClick, icon, children }) {
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant={active ? "default" : "outline"}
+      className="h-8 gap-1.5"
+      onClick={onClick}
+    >
+      {React.cloneElement(icon, { className: "size-3.5" })}
+      {children}
+    </Button>
+  );
+}
+
+function ModelBadge({ icon, children }) {
+  return (
+    <Badge variant="secondary" className="h-5 gap-1 px-1.5 text-[10px] font-medium">
+      {icon ? React.cloneElement(icon, { className: "size-3" }) : null}
+      {children}
+    </Badge>
+  );
+}
+
+function modelSearchText(model) {
+  return [
+    model.id,
+    model.name,
+    model.provider,
+    model.description,
+    formatModelCost(model),
+    formatModelModalities(model),
+    modelCreatedLabel(model),
+    supportsModelInput(model, "audio") ? "voice audio microphone speech input" : "",
+    supportsModelInput(model, "image") ? "image vision recognition photo camera" : "",
+    supportsModelParameter(model, "reasoning") ? "thinking reasoning effort" : "",
+  ].join(" ").toLowerCase();
+}
+
+function supportsModelInput(model, modality) {
+  return (model.inputModalities || []).some((value) => String(value).toLowerCase() === modality);
+}
+
+function supportsModelParameter(model, parameter) {
+  return (model.supportedParameters || []).some((value) => String(value).toLowerCase() === parameter);
+}
+
+function compareModels(a, b, sortBy) {
+  if (sortBy === "cheapest") return modelCostPerMillion(a) - modelCostPerMillion(b) || String(a.name).localeCompare(String(b.name));
+  if (sortBy === "context") return Number(b.contextLength || 0) - Number(a.contextLength || 0) || String(a.name).localeCompare(String(b.name));
+  if (sortBy === "name") return String(a.name).localeCompare(String(b.name));
+  return modelCreatedValue(b) - modelCreatedValue(a) || String(a.name).localeCompare(String(b.name));
+}
+
+function formatModelModalities(model) {
+  const input = (model.inputModalities || []).join("+") || "input ?";
+  const output = (model.outputModalities || []).join("+") || "output ?";
+  return `${input} -> ${output}`;
+}
+
+function formatModelCost(model) {
+  if (modelIsFree(model)) return "free";
+  const prompt = formatTokenPrice(model.promptPrice);
+  const completion = formatTokenPrice(model.completionPrice);
+  if (prompt === "unknown" && completion === "unknown") return "cost unknown";
+  return `in ${prompt} / out ${completion}`;
+}
+
+function modelCostPerMillion(model) {
+  const prompt = Number(model.promptPrice);
+  const completion = Number(model.completionPrice);
+  if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return Number.POSITIVE_INFINITY;
+  const safePrompt = Number.isFinite(prompt) && prompt >= 0 ? prompt : 0;
+  const safeCompletion = Number.isFinite(completion) && completion >= 0 ? completion : 0;
+  return (safePrompt + safeCompletion) * 1_000_000;
+}
+
+function modelIsFree(model) {
+  return Number(model.promptPrice) === 0 && Number(model.completionPrice) === 0;
+}
+
+function formatTokenPrice(value) {
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) return "unknown";
+  const perMillion = price * 1_000_000;
+  if (perMillion < 0.01) return `$${perMillion.toFixed(4)}/M`;
+  if (perMillion < 1) return `$${perMillion.toFixed(3)}/M`;
+  return `$${perMillion.toFixed(2)}/M`;
+}
+
+function modelCreatedValue(model) {
+  const raw = model.created ?? model.createdAt ?? model.created_at;
+  if (typeof raw === "number") return raw > 10_000_000_000 ? raw : raw * 1000;
+  const time = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function modelCreatedLabel(model) {
+  const value = modelCreatedValue(model);
+  if (!value) return "";
+  return new Date(value).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+}
+
 
 function formatEventTime(value) {
   const date = value ? new Date(value) : null;

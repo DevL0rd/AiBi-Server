@@ -60,8 +60,8 @@
     },
     {
       "id": "ability_fruit",
-      "description": "Show a fruit-themed behavior.",
-      "instructions": "Use for fruit, snack, or playful food requests when no more specific food action fits.",
+      "description": "Fruity slot machines.",
+      "instructions": "Use this when user wants to gamble / play slots.",
       "valid_params": {}
     },
     {

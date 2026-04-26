@@ -18,7 +18,6 @@ async function main() {
   const rootDir = path.resolve(args.root || process.cwd());
 
   ensureDirectory(path.join(rootDir, "firmware"));
-  ensureDirectory(path.join(rootDir, "tts"));
   await installEsp32S3Toolchain({ rootDir, force: Boolean(args.force) });
 
   console.log("Setup complete.");

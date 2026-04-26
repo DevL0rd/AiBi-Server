@@ -1,10 +1,24 @@
 import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const capabilities = JSON.parse(fs.readFileSync(path.join(__dirname, "capabilities.json"), "utf8"));
+const DEFAULT_DISABLED_ANIMATION_IDS = (capabilities.animations || [])
+  .map((animation) => typeof animation === "string" ? animation : animation?.id)
+  .filter(Boolean)
+  .map(String);
 
 const DEFAULT_SETTINGS = {
   mode: "local",
   openRouterApiKey: "",
   openRouterModel: "openai/gpt-5-mini",
+  openRouterWebSearchEnabled: false,
+  openRouterReasoningEnabled: false,
+  openRouterReasoningEffort: "medium",
+  openRouterTemperature: 0.7,
+  openRouterMaxTokens: 900,
   fishApiKey: "",
   fishVoiceId: "",
   fishModel: "s2-pro",
@@ -12,8 +26,8 @@ const DEFAULT_SETTINGS = {
   personalityPrompt: "You are AIBI: warm, curious, playful, and concise. You feel like a small embodied desktop companion, not a generic assistant.",
   localTextFallback: "A error has occured.",
   actionAfterSpeech: false,
-  disabledCapabilityIds: ["interact_mood"],
-  disabledAnimationIds: [],
+  disabledCapabilityIds: ["interact_answer_with_animation", "interact_mood", "interact_greeting"],
+  disabledAnimationIds: DEFAULT_DISABLED_ANIMATION_IDS,
 };
 
 export class AppStore {
@@ -75,6 +89,7 @@ export class AppStore {
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       if (settings[key] === undefined) this.setSetting(key, value);
     }
+    this.migrateDefaultDisabledCapabilities(settings);
   }
 
   addColumnIfMissing(table, column, type) {
@@ -89,6 +104,18 @@ export class AppStore {
       DROP TABLE IF EXISTS behaviors;
       DROP TABLE IF EXISTS animations;
     `);
+  }
+
+  migrateDefaultDisabledCapabilities(settings) {
+    const disabledCapabilityIds = new Set(settings.disabledCapabilityIds || []);
+    disabledCapabilityIds.add("interact_answer_with_animation");
+    if (disabledCapabilityIds.size !== (settings.disabledCapabilityIds || []).length) {
+      this.setSetting("disabledCapabilityIds", [...disabledCapabilityIds].sort());
+    }
+
+    if (Array.isArray(settings.disabledAnimationIds) && settings.disabledAnimationIds.length === 0) {
+      this.setSetting("disabledAnimationIds", DEFAULT_DISABLED_ANIMATION_IDS);
+    }
   }
 
   getSettings() {
@@ -219,16 +246,18 @@ export class AppStore {
       `);
 
       for (const model of models) {
+        const architecture = model.architecture || {};
+        const pricing = model.pricing || {};
         insert.run(
           model.id,
           model.name || model.id,
           model.id?.split("/")?.[0] || "",
-          model.contextLength ?? null,
-          JSON.stringify(model.architecture?.inputModalities || []),
-          JSON.stringify(model.architecture?.outputModalities || []),
-          JSON.stringify(model.supportedParameters || []),
-          model.pricing?.prompt ?? "",
-          model.pricing?.completion ?? "",
+          model.contextLength ?? model.context_length ?? null,
+          JSON.stringify(arrayValue(architecture.inputModalities ?? architecture.input_modalities)),
+          JSON.stringify(arrayValue(architecture.outputModalities ?? architecture.output_modalities)),
+          JSON.stringify(arrayValue(model.supportedParameters ?? model.supported_parameters)),
+          stringValue(pricing.prompt),
+          stringValue(pricing.completion),
           model.description || "",
           JSON.stringify(model),
           now,
@@ -256,6 +285,7 @@ export class AppStore {
           prompt_price AS promptPrice,
           completion_price AS completionPrice,
           description,
+          raw_payload AS rawPayload,
           fetched_at AS fetchedAt
         FROM openrouter_models
         ORDER BY provider ASC, name ASC
@@ -307,16 +337,35 @@ function safeJsonParse(value, fallback) {
 }
 
 function parseModelRow(row) {
+  const rawPayload = safeJsonParse(row.rawPayload, {});
+  const rawArchitecture = rawPayload.architecture || {};
+  const rawPricing = rawPayload.pricing || {};
+  const inputModalities = parseJsonArray(row.inputModalitiesJson);
+  const outputModalities = parseJsonArray(row.outputModalitiesJson);
+  const supportedParameters = parseJsonArray(row.supportedParametersJson);
   const model = {
     ...row,
-    inputModalities: parseJsonArray(row.inputModalitiesJson),
-    outputModalities: parseJsonArray(row.outputModalitiesJson),
-    supportedParameters: parseJsonArray(row.supportedParametersJson),
+    contextLength: row.contextLength ?? rawPayload.contextLength ?? rawPayload.context_length ?? null,
+    created: rawPayload.created ?? rawPayload.createdAt ?? rawPayload.created_at ?? null,
+    inputModalities: inputModalities.length ? inputModalities : arrayValue(rawArchitecture.inputModalities ?? rawArchitecture.input_modalities),
+    outputModalities: outputModalities.length ? outputModalities : arrayValue(rawArchitecture.outputModalities ?? rawArchitecture.output_modalities),
+    supportedParameters: supportedParameters.length ? supportedParameters : arrayValue(rawPayload.supportedParameters ?? rawPayload.supported_parameters),
+    promptPrice: row.promptPrice || stringValue(rawPricing.prompt),
+    completionPrice: row.completionPrice || stringValue(rawPricing.completion),
   };
   delete model.inputModalitiesJson;
   delete model.outputModalitiesJson;
   delete model.supportedParametersJson;
+  delete model.rawPayload;
   return model;
+}
+
+function arrayValue(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function stringValue(value) {
+  return value === undefined || value === null ? "" : String(value);
 }
 
 export { DEFAULT_SETTINGS };

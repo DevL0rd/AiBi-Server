@@ -34,8 +34,6 @@ export class ProxyService extends EventEmitter {
     this.firmwareDir = path.join(rootDir, "firmware");
     this.chatMediaDir = path.join(rootDir, "chat-media");
     this.pendingTtsStreams = new Map();
-    this.ttsLogTargets = new Map();
-    this.pendingTtsMedia = new Map();
     this.chatHistory = this.store.getChatMessages().map(chatMessageToHistoryItem).filter(Boolean).slice(-24);
     this.chatMode = false;
     this.nextConnectionId = 1;
@@ -45,6 +43,7 @@ export class ProxyService extends EventEmitter {
     });
     fs.mkdirSync(this.firmwareDir, { recursive: true });
     fs.mkdirSync(this.chatMediaDir, { recursive: true });
+    this.dropAudioChatMedia();
   }
 
   async start() {
@@ -455,15 +454,6 @@ export class ProxyService extends EventEmitter {
     const modelInfo = this.store.getOpenRouterModel(settings.openRouterModel);
     const preparedAudio = prepareAudio(request.body);
     const audioFormat = preparedAudio.format;
-    const userMedia = preparedAudio.buffer?.length && audioFormat
-      ? [this.saveChatMedia({
-          buffer: preparedAudio.buffer,
-          type: "audio",
-          mimeType: audioMimeType(audioFormat),
-          extension: audioFormat,
-          label: "User",
-        })]
-      : [];
 
     if (requestChatMode && audioLooksSilent(request.body)) {
       const responseJson = await this.buildProtocolResponseFromIntent({
@@ -506,6 +496,7 @@ export class ProxyService extends EventEmitter {
         history: this.chatHistory,
         chatMode: requestChatMode,
         modelInfo,
+        timeZone: query.get("timezone"),
         transcribeAudio: async ({ audio, audioFormat: format }) => {
           try {
             return await this.transcribeAudioBuffer({ id, audio, audioFormat: format });
@@ -536,7 +527,7 @@ export class ProxyService extends EventEmitter {
       index: Number(query.get("index") || 0),
       modelInfo,
     });
-    this.rememberTurn({ transcript, responseJson, userContent, userMedia });
+    this.rememberTurn({ transcript, responseJson, userContent });
     this.emit("conversation", {
       type: responseJson.queryResult?.rec_behavior === "interact_speak" ? "override_response" : "action",
       title: responseJson.queryResult?.behavior_paras?.txt || responseJson.queryResult?.rec_behavior || "Override response",
@@ -546,9 +537,10 @@ export class ProxyService extends EventEmitter {
     return responseBuffer("HTTP/1.1 200 OK", responseJson);
   }
 
-  async buildLocalProactiveResponse() {
+  async buildLocalProactiveResponse({ target = "" } = {}) {
     const modelInfo = this.store.getOpenRouterModel(this.getSettings().openRouterModel);
     const capabilities = getCapabilities(this.getSettings());
+    const query = new URL(`http://local${target || "/"}`).searchParams;
     const stageDirections = ["You decided to proactively reach out to the user."];
     let intent = {
       speech: { text: "Hi, want to chat for a bit?", listen: 0 },
@@ -565,6 +557,7 @@ export class ProxyService extends EventEmitter {
         modelInfo,
         stageDirections,
         responseMode: "speech",
+        timeZone: query.get("tz"),
       });
       intent = turn.intent;
     } catch (error) {
@@ -627,6 +620,7 @@ export class ProxyService extends EventEmitter {
             modelInfo,
             stageDirections,
             responseMode: "speech",
+            timeZone: url.searchParams.get("tz") || url.searchParams.get("timezone"),
           });
           text = turn.intent.speech?.text || text;
         } catch (error) {
@@ -692,6 +686,7 @@ export class ProxyService extends EventEmitter {
           modelInfo,
           stageDirections,
           responseMode: "speech",
+          timeZone: url.searchParams.get("tz") || url.searchParams.get("timezone"),
         });
         intent = turn.intent;
         transcript = turn.inputText;
@@ -841,38 +836,20 @@ export class ProxyService extends EventEmitter {
     if (userText || userMedia.length) this.addChatMessage("user", userText, { media: userMedia });
     const text = responseJson.queryResult?.behavior_paras?.txt;
     const ttsUrl = responseJson.queryResult?.behavior_paras?.url;
-    if (text) this.addChatMessage("assistant", text, { ttsUrl }, ttsUrl);
+    if (text) this.addChatMessage("assistant", text, { ttsUrl });
   }
 
   addChatTurn({ userContent, assistantText, assistantTtsUrl = "", userMedia = [] }) {
     if (userContent || userMedia.length) this.addChatMessage("user", userContent, { media: userMedia });
-    if (assistantText) this.addChatMessage("assistant", assistantText, { ttsUrl: assistantTtsUrl }, assistantTtsUrl);
+    if (assistantText) this.addChatMessage("assistant", assistantText, { ttsUrl: assistantTtsUrl });
   }
 
-  addChatMessage(role, content, payload = {}, ttsUrl = "") {
+  addChatMessage(role, content, payload = {}) {
     const row = this.store.addChatMessage({ role, content, payload });
     this.chatHistory.push(chatMessageToHistoryItem(row));
     this.trimChatHistory();
     this.emit("chat_message", row);
-    const ttsId = ttsUrl ? path.basename(new URL(ttsUrl, "http://local").pathname) : "";
-    if (ttsId) this.registerTtsLogTarget(ttsId, row.id);
     return row;
-  }
-
-  registerTtsLogTarget(ttsId, messageId) {
-    this.ttsLogTargets.set(ttsId, messageId);
-    const pending = this.pendingTtsMedia.get(ttsId);
-    if (pending) {
-      this.pendingTtsMedia.delete(ttsId);
-      const media = this.saveChatMedia({
-        buffer: pending.body,
-        type: "audio",
-        mimeType: pending.mimeType,
-        extension: mediaExtension(pending.mimeType),
-        label: "AIBI",
-      });
-      this.appendChatMessageMedia(messageId, media);
-    }
   }
 
   trimChatHistory() {
@@ -910,10 +887,21 @@ export class ProxyService extends EventEmitter {
     fs.rmSync(this.chatMediaDir, { recursive: true, force: true });
     fs.mkdirSync(this.chatMediaDir, { recursive: true });
     this.chatHistory = [];
-    this.ttsLogTargets.clear();
-    this.pendingTtsMedia.clear();
     this.emit("chat_log_cleared", { cleared });
     return { cleared };
+  }
+
+  dropAudioChatMedia() {
+    for (const row of this.store.getChatMessages(100000)) {
+      const media = row.payload?.media || [];
+      const kept = media.filter((item) => item.type === "image");
+      if (kept.length === media.length) continue;
+      for (const item of media) {
+        if (item.type === "audio") this.deleteChatMediaFile(item.path);
+      }
+      this.store.updateChatMessagePayload(row.id, { ...row.payload, media: kept });
+    }
+    this.refreshChatHistory();
   }
 
   saveChatMedia({ buffer, type, mimeType, extension, label }) {
@@ -928,23 +916,6 @@ export class ProxyService extends EventEmitter {
       path: `chat-media/${filename}`,
       bytes: buffer.length,
     };
-  }
-
-  captureTtsForChat(ttsId, body, mimeType) {
-    const messageId = this.ttsLogTargets.get(ttsId);
-    if (messageId) {
-      const media = this.saveChatMedia({
-        buffer: body,
-        type: "audio",
-        mimeType,
-        extension: mediaExtension(mimeType),
-        label: "AIBI",
-      });
-      this.appendChatMessageMedia(messageId, media);
-      return;
-    }
-    this.pendingTtsMedia.set(ttsId, { body, mimeType });
-    setTimeout(() => this.pendingTtsMedia.delete(ttsId), 120000).unref?.();
   }
 
   appendChatMessageMedia(messageId, media) {
@@ -1002,13 +973,11 @@ export class ProxyService extends EventEmitter {
     }
 
     this.pendingTtsStreams.delete(clean);
-    const chunks = [];
-    await writeLiveTtsResponse(client, pending, (chunk) => chunks.push(Buffer.from(chunk)));
-    if (chunks.length) this.captureTtsForChat(clean, Buffer.concat(chunks), pending.contentType);
+    await writeLiveTtsResponse(client, pending);
   }
 }
 
-async function writeLiveTtsResponse(client, pending, recordChunk) {
+async function writeLiveTtsResponse(client, pending) {
   const headers = [
     "HTTP/1.1 200 OK",
     `Content-Type: ${pending.contentType}`,
@@ -1022,7 +991,6 @@ async function writeLiveTtsResponse(client, pending, recordChunk) {
   try {
     if (pending.firstChunk?.length) {
       writeChunk(client, pending.firstChunk);
-      recordChunk(pending.firstChunk);
     }
     while (true) {
       const next = await pending.iterator.next();
@@ -1030,7 +998,6 @@ async function writeLiveTtsResponse(client, pending, recordChunk) {
       const chunk = Buffer.from(next.value);
       if (!chunk.length) continue;
       writeChunk(client, chunk);
-      recordChunk(chunk);
     }
     client.end("0\r\n\r\n");
   } catch (error) {
@@ -1081,7 +1048,7 @@ async function* readWebStream(stream) {
 
 function chatMessageToHistoryItem(row) {
   if (!row?.role || !row.content) return null;
-  return { role: row.role, content: row.content };
+  return { role: row.role, content: row.content, createdAt: row.created_at };
 }
 
 function formatChatContentForLog(content) {

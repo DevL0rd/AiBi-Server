@@ -115,6 +115,7 @@ export class OpenRouterAdapter {
     stageDirections = [],
     transcribeAudio,
     responseMode = "intent",
+    timeZone,
   }) {
     const settings = this.getSettings();
     const fallbackIntent = { ...EMPTY_INTENT, speech: { text: settings.localTextFallback, listen: 0 } };
@@ -156,27 +157,29 @@ export class OpenRouterAdapter {
       personalityPrompt: settings.personalityPrompt,
       stageDirections,
       responseMode,
+      timeZone,
     });
 
     const schema = responseMode === "speech" ? LOCAL_SPEECH_SCHEMA : LOCAL_INTENT_SCHEMA;
     const schemaName = responseMode === "speech" ? "aibi_local_speech" : "aibi_local_intent";
-    const result = await client.chat.send({
-      chatRequest: {
-        model: settings.openRouterModel,
-        messages,
-        responseFormat: {
-          type: "json_schema",
-          jsonSchema: {
-            name: schemaName,
-            strict: true,
-            schema,
-          },
+    const chatRequest = withOpenRouterOptions(settings, modelInfo, {
+      model: settings.openRouterModel,
+      messages,
+      responseFormat: {
+        type: "json_schema",
+        jsonSchema: {
+          name: schemaName,
+          strict: true,
+          schema,
         },
-        provider: {
-          requireParameters: true,
-        },
-        plugins: [{ id: "response-healing" }],
       },
+      provider: {
+        requireParameters: true,
+      },
+    });
+
+    const result = await client.chat.send({
+      chatRequest,
     });
 
     const parsed = parseIntent(result?.choices?.[0]?.message?.content);
@@ -251,6 +254,49 @@ export class OpenRouterAdapter {
   }
 }
 
+function withOpenRouterOptions(settings, modelInfo, chatRequest) {
+  const next = { ...chatRequest };
+  const plugins = [{ id: "response-healing" }];
+  if (settings.openRouterWebSearchEnabled) plugins.unshift({ id: "web" });
+  next.plugins = plugins;
+
+  if (settings.openRouterReasoningEnabled && modelSupportsParameter(modelInfo, "reasoning")) {
+    next.reasoning = {
+      effort: normalizeReasoningEffort(settings.openRouterReasoningEffort),
+    };
+  }
+
+  const temperature = numberOrNull(settings.openRouterTemperature);
+  if (temperature !== null && modelSupportsParameter(modelInfo, "temperature")) next.temperature = Math.min(2, Math.max(0, temperature));
+
+  const maxTokens = integerOrNull(settings.openRouterMaxTokens);
+  if (maxTokens !== null && maxTokens > 0 && modelSupportsParameter(modelInfo, "max_tokens")) next.maxTokens = maxTokens;
+
+  return next;
+}
+
+function modelSupportsParameter(modelInfo, parameter) {
+  const params = modelInfo?.supportedParameters || [];
+  if (!params.length) return true;
+  return params.some((value) => String(value).toLowerCase() === parameter);
+}
+
+function normalizeReasoningEffort(value) {
+  const effort = String(value || "").toLowerCase();
+  return ["minimal", "low", "medium", "high"].includes(effort) ? effort : "medium";
+}
+
+function numberOrNull(value) {
+  if (value === "" || value === undefined || value === null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function integerOrNull(value) {
+  const number = numberOrNull(value);
+  return number === null ? null : Math.floor(number);
+}
+
 function buildMessages({
   transcript,
   audio,
@@ -266,40 +312,48 @@ function buildMessages({
   personalityPrompt,
   stageDirections,
   responseMode,
+  timeZone,
 }) {
+  const now = new Date();
+  const resolvedTimeZone = normalizeTimeZone(timeZone);
+  const lastUserMessage = [...(history || [])].reverse().find((item) => item.role === "user" && item.createdAt);
+  const timeContext = buildTimeContext({ now, timeZone: resolvedTimeZone, lastUserMessage });
   const recentHistory = history.slice(-12).map((item) => ({
     role: item.role,
-    content: item.content,
+    content: annotateMessageWithTime(item.content, item.createdAt, now, resolvedTimeZone),
   }));
   const capabilityPrompt = renderCapabilityPrompt(capabilities, { chatMode });
   const stageText = formatStageDirections(stageDirections);
   const textPrefix = stageText ? `${stageText}\n` : "";
+  const latestPrefix = buildLatestMessageTimePrefix({ now, timeZone: resolvedTimeZone, lastUserMessage });
   const userContent = useAudioInput
     ? [
-        { type: "text", text: `${textPrefix}Use the attached AIBI microphone audio as the user's latest message.` },
+        { type: "text", text: `${latestPrefix}${textPrefix}Use the attached AIBI microphone audio as the user's latest message.` },
         { type: "input_audio", inputAudio: { data: audio.toString("base64"), format: audioFormat } },
       ]
     : useImageInput
     ? [
+        { type: "text", text: `${latestPrefix}${textPrefix}Use the attached AIBI camera image as the user's latest message.` },
         { type: "image_url", imageUrl: { url: `data:${imageMimeType || "image/jpeg"};base64,${image.toString("base64")}` } },
       ]
-    : formatInputText({ stageDirections, transcript }) || "The user spoke, but transcription was unavailable.";
+    : `${latestPrefix}${formatInputText({ stageDirections, transcript }) || "The user spoke, but transcription was unavailable."}`;
 
   return [
     {
       role: "system",
-      content: buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt }),
+      content: buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt, timeContext }),
     },
     ...recentHistory,
     { role: "user", content: userContent },
   ];
 }
 
-function buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt }) {
+function buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt, timeContext }) {
   const base = [
     "You are the local brain for AIBI, a small desktop companion.",
     "AIBI personality:",
     stringValue(personalityPrompt),
+    timeContext,
     "Return only the structured JSON requested by the schema.",
     "Keep speech short and natural.",
     "Text wrapped in square brackets is a stage direction or context event. Do not quote it, repeat it, or explicitly acknowledge that you received it. Let it guide what you do and say.",
@@ -317,8 +371,7 @@ function buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech,
     "Act like AIBI is physically present, not just a text assistant. When a native action would be a better response than speech, use the action directly and leave speech_text empty.",
     "When the latest user message includes attached audio, transcribe that audio into transcribed_speech. Keep transcribed_speech as only the user's spoken words, not your response. If no audio was attached, use an empty string.",
     "Use native actions naturally: dance for celebration or music, sing for song requests, animal/playful requests, breath for calming, light_control for color/light requests, movement for turn/move requests, game_rps for rock-paper-scissors etc...",
-    "When speaking, add a natural pre_animation, post_animation, or post_behavior from the provided native_animations lists when it fits the response. Prefer post_animation for visual expression and post_behavior for a native behavior after speech.",
-    "Good expressive speech animations include greeting_happy, greeting_wink, animal_cat1, animal_rabbit1, show_blow_bubbles, dance_ai1, dance_disco1, mood_happy, mood_surprise, mood_shy.",
+    "When speaking, add a natural pre_animation, post_animation, or post_behavior only from non-empty provided native_animations lists when it fits the response.",
     "If the user needs information, answer with speech. If the user wants AIBI to do something physical, prefer the native action. Do not explain that you are using an action.",
     actionAfterSpeech
       ? "Action-after-speech is enabled for code-derived post_behavior values, so you may combine speech_text with action_behavior when useful."
@@ -345,6 +398,72 @@ function formatStageDirections(stageDirections = []) {
 
 function formatInputText({ stageDirections = [], transcript = "" }) {
   return [formatStageDirections(stageDirections), stringValue(transcript)].filter(Boolean).join("\n");
+}
+
+function buildTimeContext({ now, timeZone, lastUserMessage }) {
+  const current = formatLocalDateTime(now, timeZone);
+  const last = lastUserMessage?.createdAt
+    ? `${formatRelativeAge(new Date(lastUserMessage.createdAt), now)} ago`
+    : "none in recent history";
+  return `Time context: user local time is ${current.date} ${current.time} (${timeZone}); previous user message was ${last}.`;
+}
+
+function buildLatestMessageTimePrefix({ now, timeZone, lastUserMessage }) {
+  const current = formatLocalDateTime(now, timeZone);
+  const since = lastUserMessage?.createdAt
+    ? formatRelativeAge(new Date(lastUserMessage.createdAt), now)
+    : "no prior user message";
+  return `[message_time ${current.date} ${current.time}; since_previous_user_message ${since}]\n`;
+}
+
+function annotateMessageWithTime(content, createdAt, now, timeZone) {
+  const text = stringValue(content);
+  if (!createdAt) return text;
+  const created = new Date(createdAt);
+  if (Number.isNaN(created.getTime())) return text;
+  const local = formatLocalDateTime(created, timeZone);
+  return `[message_time ${local.date} ${local.time}; age ${formatRelativeAge(created, now)}]\n${text}`;
+}
+
+function formatLocalDateTime(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date).reduce((acc, part) => {
+    if (part.type !== "literal") acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    time: `${parts.hour}:${parts.minute}`,
+  };
+}
+
+function formatRelativeAge(from, to) {
+  if (!(from instanceof Date) || Number.isNaN(from.getTime())) return "unknown";
+  const seconds = Math.max(0, Math.round((to.getTime() - from.getTime()) / 1000));
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+function normalizeTimeZone(value) {
+  const zone = stringValue(value) || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone }).format(new Date());
+    return zone;
+  } catch {
+    return "UTC";
+  }
 }
 
 function buildLoggedUserContent({ originalContent, stageDirections = [], transcript = "", hasAudioInput = false }) {
@@ -503,11 +622,17 @@ function filterActionParams(behavior, params, capabilities = {}) {
   return Object.fromEntries(Object.entries(params).filter(([key, value]) => {
     const allowed = schema[key];
     if (Array.isArray(allowed)) return allowed.includes(value);
-    if (allowed === "number") return typeof value === "number";
-    if (allowed === "firmware_animation") return firmwareAnimationNames.has(value);
-    if (allowed === "string") return typeof value === "string" && value.trim();
-    return false;
+    return isAllowedParamValue(allowed, value, firmwareAnimationNames);
   }));
+}
+
+function isAllowedParamValue(allowed, value, firmwareAnimationNames) {
+  if (allowed === "number") return typeof value === "number";
+  if (allowed === "number 1-12") return typeof value === "number" && value >= 1 && value <= 12;
+  if (allowed === "HH:mm") return typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+  if (allowed === "firmware_animation") return firmwareAnimationNames.has(value);
+  if (allowed === "string") return typeof value === "string" && value.trim();
+  return false;
 }
 
 function stringValue(value) {
