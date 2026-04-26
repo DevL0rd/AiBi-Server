@@ -7,10 +7,10 @@ import path from "node:path";
 
 const DEFAULTS = {
   version: "1.6.0",
-  sourceDir: "captures/firmware/analysis/1.6.0",
-  decompiledDir: "captures/firmware/decompiled/1.6.0",
-  originalZip: "captures/firmware/1.6.0.zip",
-  outDir: "captures/firmware/rebuilt",
+  sourceDir: "firmware/analysis/1.6.0",
+  decompiledDir: "firmware/decompiled/1.6.0",
+  originalZip: "firmware/1.6.0.zip",
+  outDir: "firmware/rebuilt",
 };
 
 function main() {

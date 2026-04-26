@@ -5,9 +5,9 @@ import path from "node:path";
 
 const DEFAULTS = {
   version: "1.6.0",
-  sourceDir: "captures/firmware/analysis/1.6.0",
-  decompiledDir: "captures/firmware/decompiled/1.6.0",
-  outDir: "captures/firmware/patched",
+  sourceDir: "firmware/analysis/1.6.0",
+  decompiledDir: "firmware/decompiled/1.6.0",
+  outDir: "firmware/patched",
   intentTimeoutMs: 300000,
   originalHost: "api.aibipocket.com",
   timeoutLiteralAddress: 0x42000974,

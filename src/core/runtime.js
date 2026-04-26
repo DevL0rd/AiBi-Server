@@ -3,6 +3,7 @@ import { AppStore } from "./store.js";
 import { FishAudioAdapter } from "./fishAudioAdapter.js";
 import { OpenRouterAdapter } from "./openRouterAdapter.js";
 import { ProxyService } from "./proxyService.js";
+import { getCapabilityCatalog } from "./capabilities.js";
 
 export function createRuntime({ rootDir }) {
   const events = new EventEmitter();
@@ -24,12 +25,17 @@ export function createRuntime({ rootDir }) {
   };
 
   proxy.on("conversation", record);
+  proxy.on("stored_event", (row) => events.emit("event", { kind: "event", event: row }));
+  proxy.on("chat_message", (message) => events.emit("event", { kind: "chat_message", message }));
+  proxy.on("chat_message_deleted", ({ id }) => events.emit("event", { kind: "chat_message_deleted", id }));
+  proxy.on("chat_log_cleared", (result) => events.emit("event", { kind: "chat_log_cleared", ...result }));
   proxy.on("proxy_error", (error) => record({
     type: "warning",
     title: "Proxy notice",
     detail: error.message,
     payload: error,
   }));
+  proxy.on("dns_event", record);
   proxy.on("status", (status) => events.emit("event", { kind: "status", status }));
   proxy.on("connection", (connection) => events.emit("event", { kind: "connection", connection }));
 
@@ -70,20 +76,27 @@ export function createRuntime({ rootDir }) {
       return {
         settings: getSettings(),
         events: store.getRecentEvents(),
-        learned: store.getLearned(),
+        chatMessages: proxy.getChatLog(),
         models: store.getOpenRouterModels(),
+        capabilities: getCapabilityCatalog(),
       };
     },
-    resetChatHistory() {
-      const history = proxy.resetChatHistory({ emitEvent: false });
+    clearEvents() {
       const eventsCleared = store.clearEvents();
-      const row = record({
-        type: "mode",
-        title: "History reset",
-        detail: `${history.cleared} chat messages and ${eventsCleared} log entries cleared`,
-        payload: { chatMessagesCleared: history.cleared, eventsCleared },
-      });
-      return { ...history, eventsCleared, event: row };
+      events.emit("event", { kind: "events_cleared", eventsCleared });
+      return { eventsCleared };
+    },
+    clearChatLog() {
+      return proxy.clearChatLog();
+    },
+    updateChatMessage({ id, content }) {
+      return proxy.updateChatMessage(id, content);
+    },
+    deleteChatMessage(id) {
+      return proxy.deleteChatMessage(id);
+    },
+    getChatMedia(relativePath) {
+      return proxy.getChatMedia(relativePath);
     },
     saveSettings(settings) {
       const next = store.saveSettings(settings);
@@ -96,7 +109,7 @@ export function createRuntime({ rootDir }) {
       events.emit("event", { kind: "settings", settings });
       record({
         type: "mode",
-        title: mode === "local" ? "Local AI mode" : "Pass-through mode",
+        title: mode === "local" ? "Override mode" : "Pass-through mode",
         detail: "",
         payload: { mode },
       });

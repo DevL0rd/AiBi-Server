@@ -1,12 +1,14 @@
 node_modules/
 dist/
+.tools/
 
 # Runtime data
 aibi.sqlite
 aibi.sqlite-*
-captures/
+firmware/
 logs/
 tts/
+chat-media/
 
 # Local/editor noise
 .env

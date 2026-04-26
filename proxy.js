@@ -13,7 +13,7 @@ runtime.on("event", (event) => {
 });
 
 await runtime.startProxy();
-process.stdout.write("AiBi proxy running on HTTP :80 and HTTPS :443\n");
+process.stdout.write("AIBI proxy running on HTTP :80, HTTPS :443, and DNS :53\n");
 
 process.on("SIGINT", async () => {
   await runtime.stopProxy();

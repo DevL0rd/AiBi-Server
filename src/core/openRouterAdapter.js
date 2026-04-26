@@ -3,13 +3,17 @@ const LOCAL_INTENT_SCHEMA = {
   properties: {
     speech_text: {
       type: "string",
-      description: "Short natural speech for the robot to say, or an empty string when only changing mode or starting recognition.",
+      description: "Short natural speech for AIBI to say, or an empty string when only changing mode or starting recognition.",
     },
     speech_listen: {
       type: "integer",
       minimum: 0,
       maximum: 1,
-      description: "Use 1 only when the robot should keep listening after this response.",
+      description: "Use 1 only when AIBI should keep listening after this response.",
+    },
+    transcribed_speech: {
+      type: "string",
+      description: "Exact transcript of the user's latest spoken audio. Use an empty string when no audio was attached.",
     },
     chat_mode: {
       type: "string",
@@ -18,7 +22,7 @@ const LOCAL_INTENT_SCHEMA = {
     },
     action_behavior: {
       type: "string",
-      description: "A native robot behavior id from the provided capabilities, or empty string.",
+      description: "A native AIBI behavior id from the provided capabilities, or empty string.",
     },
     action_params_json: {
       type: "string",
@@ -26,7 +30,7 @@ const LOCAL_INTENT_SCHEMA = {
     },
     recognition_enabled: {
       type: "boolean",
-      description: "True when the robot should perform its native image recognition flow.",
+      description: "True when AIBI should perform its native image recognition flow.",
     },
     pre_animation: {
       type: "string",
@@ -44,6 +48,7 @@ const LOCAL_INTENT_SCHEMA = {
   required: [
     "speech_text",
     "speech_listen",
+    "transcribed_speech",
     "chat_mode",
     "action_behavior",
     "action_params_json",
@@ -55,8 +60,27 @@ const LOCAL_INTENT_SCHEMA = {
   additionalProperties: false,
 };
 
+const LOCAL_SPEECH_SCHEMA = {
+  type: "object",
+  properties: {
+    speech_text: {
+      type: "string",
+      description: "Short natural speech for AIBI to say.",
+    },
+    speech_listen: {
+      type: "integer",
+      minimum: 0,
+      maximum: 1,
+      description: "Use 1 only when AIBI should keep listening after this response.",
+    },
+  },
+  required: ["speech_text", "speech_listen"],
+  additionalProperties: false,
+};
+
 const EMPTY_INTENT = {
   speech: { text: "", listen: 0 },
+  transcribedSpeech: "",
   mode: { chat: "unchanged" },
   action: { behavior: "" },
   recognition: { enabled: false },
@@ -78,18 +102,47 @@ export class OpenRouterAdapter {
     return response?.data || [];
   }
 
-  async generateLocalIntent({ transcript, audio, audioFormat, image, imageMimeType, capabilities, history, chatMode, modelInfo, proactive = false }) {
+  async generateLocalIntent({
+    transcript,
+    audio,
+    audioFormat,
+    image,
+    imageMimeType,
+    capabilities,
+    history = [],
+    chatMode,
+    modelInfo,
+    stageDirections = [],
+    transcribeAudio,
+    responseMode = "intent",
+  }) {
     const settings = this.getSettings();
+    const fallbackIntent = { ...EMPTY_INTENT, speech: { text: settings.localTextFallback, listen: 0 } };
     if (!settings.openRouterApiKey) {
-      return { ...EMPTY_INTENT, speech: { text: settings.localTextFallback || "I heard you.", listen: 0 } };
+      const inputText = formatInputText({ stageDirections, transcript });
+      return { intent: fallbackIntent, inputText, latestUserContent: inputText };
     }
 
     const { OpenRouter } = await import("@openrouter/sdk");
     const client = new OpenRouter({ apiKey: settings.openRouterApiKey });
-    const useAudioInput = supportsModality(modelInfo, "input", "audio") && audio && audioFormat;
+    const hasAudioInput = Boolean(audio?.length && audioFormat);
+    const useAudioInput = supportsModality(modelInfo, "input", "audio") && hasAudioInput;
     const useImageInput = supportsModality(modelInfo, "input", "image") && image?.length;
+    let inputText = stringValue(transcript);
+
+    if (!useAudioInput && audio?.length && audioFormat && transcribeAudio) {
+      inputText = stringValue(await transcribeAudio({ audio, audioFormat }));
+    }
+
+    if (!useImageInput && image?.length) {
+      const description = await this.describeImageForFallback({ image, mimeType: imageMimeType });
+      inputText = description
+        ? `The user sent an image. Image description: ${description}`
+        : "The user sent an image, but image description failed.";
+    }
+
     const messages = buildMessages({
-      transcript,
+      transcript: inputText,
       audio,
       audioFormat,
       image,
@@ -100,9 +153,13 @@ export class OpenRouterAdapter {
       useAudioInput,
       useImageInput,
       actionAfterSpeech: settings.actionAfterSpeech && Boolean(capabilities.native_animations?.post_behavior?.length),
-      proactive,
+      personalityPrompt: settings.personalityPrompt,
+      stageDirections,
+      responseMode,
     });
 
+    const schema = responseMode === "speech" ? LOCAL_SPEECH_SCHEMA : LOCAL_INTENT_SCHEMA;
+    const schemaName = responseMode === "speech" ? "aibi_local_speech" : "aibi_local_intent";
     const result = await client.chat.send({
       chatRequest: {
         model: settings.openRouterModel,
@@ -110,9 +167,9 @@ export class OpenRouterAdapter {
         responseFormat: {
           type: "json_schema",
           jsonSchema: {
-            name: "aibi_local_intent",
+            name: schemaName,
             strict: true,
-            schema: LOCAL_INTENT_SCHEMA,
+            schema,
           },
         },
         provider: {
@@ -122,9 +179,23 @@ export class OpenRouterAdapter {
       },
     });
 
-    const intent = normalizeIntent(parseIntent(result?.choices?.[0]?.message?.content), capabilities);
+    const parsed = parseIntent(result?.choices?.[0]?.message?.content);
+    const intent = responseMode === "speech" ? normalizeSpeechIntent(parsed) : normalizeIntent(parsed, capabilities);
+    if (hasAudioInput && !useAudioInput) intent.transcribedSpeech = inputText;
+    const finalInputText = hasAudioInput
+      ? stringValue(intent.transcribedSpeech) || inputText
+      : inputText;
     if (chatMode && intent.mode.chat === "connect") intent.mode.chat = "unchanged";
-    return intent;
+    return {
+      intent,
+      inputText: formatInputText({ stageDirections, transcript: finalInputText }),
+      latestUserContent: buildLoggedUserContent({
+        originalContent: messages[messages.length - 1]?.content,
+        stageDirections,
+        transcript: finalInputText,
+        hasAudioInput,
+      }),
+    };
   }
 
   async synthesizeSpeech({ text }) {
@@ -149,7 +220,7 @@ export class OpenRouterAdapter {
     });
   }
 
-  async describeImage({ image, mimeType = "image/jpeg" }) {
+  async describeImageForFallback({ image, mimeType = "image/jpeg" }) {
     const settings = this.getSettings();
     if (!settings.openRouterApiKey || !image?.length) return "";
 
@@ -161,7 +232,7 @@ export class OpenRouterAdapter {
         messages: [
           {
             role: "system",
-            content: "Describe the image plainly for another chat model. Do not roleplay, do not answer as the robot, and do not add personality.",
+            content: "Describe the image plainly for another chat model. Do not roleplay, do not answer as AIBI, and do not add personality.",
           },
           {
             role: "user",
@@ -180,74 +251,129 @@ export class OpenRouterAdapter {
   }
 }
 
-function buildMessages({ transcript, audio, audioFormat, image, imageMimeType, capabilities, history, chatMode, useAudioInput, useImageInput, actionAfterSpeech, proactive }) {
+function buildMessages({
+  transcript,
+  audio,
+  audioFormat,
+  image,
+  imageMimeType,
+  capabilities,
+  history,
+  chatMode,
+  useAudioInput,
+  useImageInput,
+  actionAfterSpeech,
+  personalityPrompt,
+  stageDirections,
+  responseMode,
+}) {
   const recentHistory = history.slice(-12).map((item) => ({
     role: item.role,
     content: item.content,
   }));
-  const capabilityPrompt = renderCapabilityPrompt(capabilities);
-  const userContent = proactive
-    ? "The robot decided to proactively reach out. Produce the short opener it should say now."
-    : useAudioInput
+  const capabilityPrompt = renderCapabilityPrompt(capabilities, { chatMode });
+  const stageText = formatStageDirections(stageDirections);
+  const textPrefix = stageText ? `${stageText}\n` : "";
+  const userContent = useAudioInput
     ? [
-        { type: "text", text: "Use the attached robot microphone audio as the user's latest message." },
+        { type: "text", text: `${textPrefix}Use the attached AIBI microphone audio as the user's latest message.` },
         { type: "input_audio", inputAudio: { data: audio.toString("base64"), format: audioFormat } },
       ]
     : useImageInput
     ? [
-        { type: "text", text: "Use the attached robot camera image as the user's latest message. Respond exactly like a normal chat turn." },
         { type: "image_url", imageUrl: { url: `data:${imageMimeType || "image/jpeg"};base64,${image.toString("base64")}` } },
       ]
-    : transcript || "The user spoke, but transcription was unavailable.";
+    : formatInputText({ stageDirections, transcript }) || "The user spoke, but transcription was unavailable.";
 
   return [
     {
       role: "system",
-      content: [
-        "You are the local brain for a small desktop robot.",
-        "Return only the structured JSON requested by the schema.",
-        "Keep speech short and natural.",
-        "Use only provided native robot capabilities. Unknown actions or animations must be empty strings.",
-        "Act like an embodied robot, not just a text assistant. When a native action would be a better response than speech, use the action directly and leave speech_text empty.",
-        "Use native actions naturally: dance for celebration or music, sing for song requests, animal for animal/playful requests, mood for emotional reactions, greeting for greetings, breath for calming, light_control for color/light requests, movement for turn/move requests, game_rps for rock-paper-scissors, recognize for looking/seeing/photo understanding.",
-        "When speaking, add a natural pre_animation, post_animation, or post_behavior from the provided native_animations lists when it fits the response. Prefer post_animation for visual expression and post_behavior for a native behavior after speech.",
-        "Good expressive speech animations include greeting_happy, greeting_wink, animal_cat1, animal_rabbit1, show_blow_bubbles, dance_ai1, dance_disco1, mood_happy, mood_surprise, mood_shy, and chatgpt_think when present.",
-        "Do not use interact_answer_with_animation. For speech with expression, use interact_speak with pre_animation or post_animation.",
-        "If the user needs information, answer with speech. If the user wants the robot to do something physical, prefer the native action. Do not explain that you are using an action.",
-        actionAfterSpeech
-          ? "Action-after-speech is enabled for code-derived post_behavior values, so you may combine speech_text with action_behavior when useful."
-          : "Action-after-speech is unavailable from code-derived capabilities, so for direct native action requests leave speech_text empty and set action_behavior.",
-        "When chat mode is active and the user wants to stop, leave, end the conversation, or says goodbye, set chat_mode to quit.",
-        "Only set chat_mode to connect when chat mode is inactive and the user explicitly asks for an ongoing conversation, such as let's chat, let's talk, talk with me, start a conversation, or keep talking.",
-        "Also set chat_mode to connect when the latest user request clearly cannot be handled as a single reply and needs a back-and-forth conversation.",
-        "Do not set chat_mode to connect for ordinary questions, commands, greetings, image descriptions, jokes, facts, short requests, or anything that can be answered in one response.",
-        "If chat mode is already active, do not set chat_mode to connect again; answer with speech_text or a native action instead.",
-        proactive
-          ? "This request is a proactive reachout: the robot is initiating contact without user speech. Greet briefly or make a simple timely invitation. Do not imply the user just asked a question. Set speech_listen to 1 when you want the robot to keep listening after the opener."
-          : "This request is a response to the user's latest speech or action.",
-        "Use action_params_json only when the selected action_behavior has documented params in action_param_schemas. Otherwise use {}.",
-        "Use only animation names listed in native_animations.pre_animation or native_animations.post_animation for those fields. Use only behavior IDs listed in native_animations.post_behavior for post_behavior.",
-        "Use the flat schema fields as follows: speech_text, speech_listen, chat_mode, action_behavior, action_params_json, recognition_enabled, pre_animation, post_animation, post_behavior.",
-        `Chat mode is currently ${chatMode ? "active" : "inactive"}.`,
-        capabilityPrompt,
-      ].join("\n"),
+      content: buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt }),
     },
     ...recentHistory,
     { role: "user", content: userContent },
   ];
 }
 
-function renderCapabilityPrompt(capabilities = {}) {
-  const behaviors = capabilities.native_behaviors || [];
-  const params = capabilities.action_param_schemas || {};
+function buildSystemPrompt({ personalityPrompt, responseMode, actionAfterSpeech, chatMode, capabilityPrompt }) {
+  const base = [
+    "You are the local brain for AIBI, a small desktop companion.",
+    "AIBI personality:",
+    stringValue(personalityPrompt),
+    "Return only the structured JSON requested by the schema.",
+    "Keep speech short and natural.",
+    "Text wrapped in square brackets is a stage direction or context event. Do not quote it, repeat it, or explicitly acknowledge that you received it. Let it guide what you do and say.",
+  ];
+
+  if (responseMode === "speech") {
+    return [
+      ...base,
+      "Use the flat schema fields as follows: speech_text, speech_listen.",
+    ].join("\n");
+  }
+
+  return [
+    ...base,
+    "Act like AIBI is physically present, not just a text assistant. When a native action would be a better response than speech, use the action directly and leave speech_text empty.",
+    "When the latest user message includes attached audio, transcribe that audio into transcribed_speech. Keep transcribed_speech as only the user's spoken words, not your response. If no audio was attached, use an empty string.",
+    "Use native actions naturally: dance for celebration or music, sing for song requests, animal/playful requests, breath for calming, light_control for color/light requests, movement for turn/move requests, game_rps for rock-paper-scissors etc...",
+    "When speaking, add a natural pre_animation, post_animation, or post_behavior from the provided native_animations lists when it fits the response. Prefer post_animation for visual expression and post_behavior for a native behavior after speech.",
+    "Good expressive speech animations include greeting_happy, greeting_wink, animal_cat1, animal_rabbit1, show_blow_bubbles, dance_ai1, dance_disco1, mood_happy, mood_surprise, mood_shy.",
+    "If the user needs information, answer with speech. If the user wants AIBI to do something physical, prefer the native action. Do not explain that you are using an action.",
+    actionAfterSpeech
+      ? "Action-after-speech is enabled for code-derived post_behavior values, so you may combine speech_text with action_behavior when useful."
+      : "Action-after-speech is unavailable from code-derived capabilities, so for direct native action requests leave speech_text empty and set action_behavior.",
+    chatMode
+      ? "For chat_mode, only use quit when the user wants to stop, leave, end the conversation, or says goodbye. Otherwise use unchanged."
+      : "For chat_mode, only use connect when the user explicitly asks for an ongoing conversation, such as let's chat, let's talk, talk with me, start a conversation, or keep talking. Otherwise use unchanged.",
+    chatMode
+      ? "For ordinary questions, commands, greetings, image descriptions, jokes, facts, and short requests, answer with speech_text or a native action."
+      : "Do not set chat_mode to connect for ordinary questions, commands, greetings, image descriptions, jokes, facts, short requests, or anything that can be answered or executed in one response.",
+    "Use action_params_json only when the selected action_behavior has documented params in action_param_schemas. Otherwise use {}.",
+    "Use only animation names listed in native_animations.pre_animation or native_animations.post_animation for those fields. Use only behavior IDs listed in native_animations.post_behavior for post_behavior.",
+    "Use the flat schema fields as follows: speech_text, speech_listen, transcribed_speech, chat_mode, action_behavior, action_params_json, recognition_enabled, pre_animation, post_animation, post_behavior.",
+    capabilityPrompt,
+  ].join("\n");
+}
+
+function formatStageDirections(stageDirections = []) {
+  const list = Array.isArray(stageDirections) ? stageDirections : [stageDirections];
+  return list.map((value) => stringValue(value)).filter(Boolean).map((value) => (
+    value.startsWith("[") && value.endsWith("]") ? value : `[${value}]`
+  )).join("\n");
+}
+
+function formatInputText({ stageDirections = [], transcript = "" }) {
+  return [formatStageDirections(stageDirections), stringValue(transcript)].filter(Boolean).join("\n");
+}
+
+function buildLoggedUserContent({ originalContent, stageDirections = [], transcript = "", hasAudioInput = false }) {
+  if (!hasAudioInput) return originalContent;
+  return formatInputText({ stageDirections, transcript }) || "[audio attached]";
+}
+
+function renderCapabilityPrompt(capabilities = {}, { chatMode = false } = {}) {
+  const actions = (capabilities.actions || []).map((action) => action.id === "ability_chatgpt"
+    ? {
+        ...action,
+        instructions: chatMode
+          ? "Use type=quit only when the user wants to stop the ongoing conversation."
+          : "Use type=connect only when the user explicitly asks for an ongoing conversation.",
+        valid_params: { type: [chatMode ? "quit" : "connect"] },
+      }
+    : action);
   const animations = capabilities.firmware_animation_names || [];
   const preAnimations = capabilities.native_animations?.pre_animation || [];
   const postAnimations = capabilities.native_animations?.post_animation || [];
   const postBehaviors = capabilities.native_animations?.post_behavior || [];
 
   return [
-    "Native behavior IDs and params:",
-    ...behaviors.map((behavior) => `- ${behavior}${formatParamSchema(params[behavior])}`),
+    "Native actions:",
+    ...actions.map((action) => [
+      `- ${action.id}: ${action.description}`,
+      action.instructions ? `  instructions: ${action.instructions}` : "",
+      `  valid_params: ${formatParamSchema(action.valid_params)}`,
+    ].filter(Boolean).join("\n")),
     "Animation IDs for pre_animation and post_animation:",
     wrapList(animations),
     "Post-speech behavior IDs for post_behavior:",
@@ -258,12 +384,12 @@ function renderCapabilityPrompt(capabilities = {}) {
 }
 
 function formatParamSchema(schema) {
-  if (!schema || typeof schema !== "object" || !Object.keys(schema).length) return "";
+  if (!schema || typeof schema !== "object" || !Object.keys(schema).length) return "{}";
   const fields = Object.entries(schema).map(([key, value]) => {
     if (Array.isArray(value)) return `${key}=${value.join("|")}`;
     return `${key}=${value}`;
   });
-  return ` params: { ${fields.join(", ")} }`;
+  return `{ ${fields.join(", ")} }`;
 }
 
 function wrapList(values, lineLength = 140) {
@@ -293,6 +419,16 @@ function parseIntent(content) {
   }
 }
 
+function normalizeSpeechIntent(intent) {
+  return {
+    ...EMPTY_INTENT,
+    speech: {
+      text: stringValue(intent?.speech_text || intent?.speech?.text),
+      listen: intent?.speech_listen === 1 || intent?.speech?.listen === 1 ? 1 : 0,
+    },
+  };
+}
+
 function normalizeIntent(intent, capabilities) {
   const nativeBehaviors = new Set(capabilities.native_behaviors || []);
   const preAnimations = new Set(capabilities.native_animations?.pre_animation || []);
@@ -301,6 +437,7 @@ function normalizeIntent(intent, capabilities) {
   const flatIntent = intent?.speech_text !== undefined
     ? {
         speech: { text: intent.speech_text, listen: intent.speech_listen },
+        transcribedSpeech: intent.transcribed_speech,
         mode: { chat: intent.chat_mode },
         action: { behavior: intent.action_behavior, params: parseActionParams(intent.action_params_json) },
         recognition: { enabled: intent.recognition_enabled },
@@ -317,6 +454,7 @@ function normalizeIntent(intent, capabilities) {
       text: stringValue(flatIntent?.speech?.text),
       listen: flatIntent?.speech?.listen === 1 ? 1 : 0,
     },
+    transcribedSpeech: stringValue(flatIntent?.transcribedSpeech),
     mode: {
       chat: ["unchanged", "connect", "quit"].includes(flatIntent?.mode?.chat) ? flatIntent.mode.chat : "unchanged",
     },

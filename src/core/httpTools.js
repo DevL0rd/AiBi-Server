@@ -122,10 +122,10 @@ export function parseHttpMessages(buffer) {
 }
 
 export class HttpInspector {
-  constructor({ id, side, captureDir, emit }) {
+  constructor({ id, side, bodyDir, emit }) {
     this.id = id;
     this.side = side;
-    this.captureDir = captureDir;
+    this.bodyDir = bodyDir;
     this.emit = emit;
     this.buffer = Buffer.alloc(0);
     this.count = 0;
@@ -168,7 +168,7 @@ export class HttpInspector {
     } else if (message.body.length) {
       const ext = contentType.includes("mpeg") ? ".mp3" : contentType.includes("octet-stream") ? ".bin" : ".dat";
       const stamp = `${Date.now()}-${process.pid}-${captureSequence++}`;
-      const filePath = path.join(this.captureDir, `${stamp}-${this.id}-${this.side}-${this.count}${ext}`);
+      const filePath = path.join(this.bodyDir, `${stamp}-${this.id}-${this.side}-${this.count}${ext}`);
       try {
         fs.writeFileSync(filePath, message.body);
         bodySummary = { kind: "binary", bytes: message.body.length, contentType: contentType || "unknown", filePath };

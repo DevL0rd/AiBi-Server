@@ -9,7 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 const DEFAULTS = {
   apiHost: "api.aibipocket.com",
   dbName: "aibi.sqlite",
-  outDir: "captures/firmware",
+  outDir: "firmware",
   identityFile: "firmware-identity.json",
   type: "1",
   versionNum: "8",
@@ -75,7 +75,7 @@ async function main() {
 
   let probeCandidates = [];
   if (!args.offline) {
-    const auth = options.noAuth ? {} : await getRobotAuthHeaders(options);
+    const auth = options.noAuth ? {} : await getAibiAuthHeaders(options);
     const probes = await probeFirmwareEndpoints({ ...options, auth });
     report.probes = probes.map(summarizeProbe);
     probeCandidates = probes.map((probe) => probe.metadata).filter(Boolean);
@@ -116,8 +116,8 @@ async function probeFirmwareEndpoints({ type, versionNum, currentName, language,
   return results;
 }
 
-async function getRobotAuthHeaders(options) {
-  const identity = readLatestRobotIdentity(options.dbPath);
+async function getAibiAuthHeaders(options) {
+  const identity = readLatestAibiIdentity(options.dbPath);
   const deviceId = options.deviceId;
   const versionNum = options.versionNum || identity.versionNum;
   const currentName = options.currentName || identity.currentName;
@@ -135,7 +135,7 @@ async function getRobotAuthHeaders(options) {
   const tokenType = tokenResponse.json?.type || "Bearer";
   if (!accessToken) {
     const message = tokenResponse.json?.errmsg || tokenResponse.error || tokenResponse.text || "token request failed";
-    throw new Error(`Could not refresh robot token: ${message}`);
+    throw new Error(`Could not refresh AIBI token: ${message}`);
   }
 
   return {
@@ -398,7 +398,7 @@ function normalizeRequestHeaders(headers, { versionNum, currentName }) {
   return normalized;
 }
 
-function readLatestRobotIdentity(dbPath) {
+function readLatestAibiIdentity(dbPath) {
   const fallback = {
     deviceId: "",
     versionNum: DEFAULTS.versionNum,

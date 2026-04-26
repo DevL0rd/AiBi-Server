@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { buildHttpMessage, decodeBody, encodeHeaders, HttpInspector, parseHttpMessages } from "./httpTools.js";
@@ -16,9 +17,10 @@ import {
   responseBuffer,
   summarizeDetectIntent,
 } from "./aibiProtocol.js";
-import { supportsModality } from "./openRouterAdapter.js";
-import { TtsCache } from "./ttsCache.js";
-import { FIRMWARE_ACTION_PARAMS, FIRMWARE_ANIMATIONS, FIRMWARE_BEHAVIORS } from "./firmwareCapabilities.js";
+import { DnsService } from "./dnsService.js";
+import { getCapabilities } from "./capabilities.js";
+
+const POWER_ON_TEXT = "Hi.";
 
 export class ProxyService extends EventEmitter {
   constructor({ rootDir, getSettings, store, openRouter, fishAudio }) {
@@ -28,24 +30,34 @@ export class ProxyService extends EventEmitter {
     this.store = store;
     this.openRouter = openRouter;
     this.fishAudio = fishAudio;
-    this.captureDir = path.join(rootDir, "captures");
-    this.firmwareDir = path.join(this.captureDir, "firmware");
-    this.ttsDir = path.join(rootDir, "tts");
-    this.ttsCache = new TtsCache();
-    this.chatHistory = [];
+    this.tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aibi-server-"));
+    this.firmwareDir = path.join(rootDir, "firmware");
+    this.chatMediaDir = path.join(rootDir, "chat-media");
+    this.pendingTtsStreams = new Map();
+    this.ttsLogTargets = new Map();
+    this.pendingTtsMedia = new Map();
+    this.chatHistory = this.store.getChatMessages().map(chatMessageToHistoryItem).filter(Boolean).slice(-24);
     this.chatMode = false;
     this.nextConnectionId = 1;
     this.servers = [];
-    fs.mkdirSync(this.captureDir, { recursive: true });
+    this.dns = new DnsService({
+      emit: (event) => this.emit("dns_event", event),
+    });
     fs.mkdirSync(this.firmwareDir, { recursive: true });
-    fs.mkdirSync(this.ttsDir, { recursive: true });
+    fs.mkdirSync(this.chatMediaDir, { recursive: true });
   }
 
   async start() {
     if (this.servers.length) return { running: true };
     const settings = this.getSettings();
-    const key = fs.readFileSync(path.join(this.rootDir, "aibi.key"));
-    const cert = fs.readFileSync(path.join(this.rootDir, "aibi.crt"));
+    const keyPath = path.join(this.rootDir, "aibi.key");
+    const certPath = path.join(this.rootDir, "aibi.crt");
+    if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+      throw new Error("Missing aibi.key or aibi.crt in the project root. Add them before starting the AIBI proxy.");
+    }
+
+    const key = fs.readFileSync(keyPath);
+    const cert = fs.readFileSync(certPath);
 
     const tlsServer = tls.createServer({ key, cert, minVersion: "TLSv1.2" }, (socket) => {
       const upstream = tls.connect({
@@ -67,13 +79,26 @@ export class ProxyService extends EventEmitter {
     ]);
 
     this.servers = [tlsServer, httpServer];
+    try {
+      await this.dns.start();
+    } catch (error) {
+      this.emit("dns_event", {
+        type: "warning",
+        title: "DNS server did not start",
+        detail: error.message,
+        payload: { message: error.message, code: error.code },
+      });
+    }
     this.emit("status", { running: true });
     return { running: true };
   }
 
   async stop() {
+    await this.dns.stop();
     await Promise.all(this.servers.map((server) => closeServer(server)));
     this.servers = [];
+    fs.rmSync(this.tempDir, { recursive: true, force: true });
+    this.tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aibi-server-"));
     this.emit("status", { running: false });
     return { running: false };
   }
@@ -81,8 +106,8 @@ export class ProxyService extends EventEmitter {
   wireConnection({ client, upstream, scheme }) {
     const id = this.nextConnectionId++;
     const context = { id, scheme, pendingRequests: [] };
-    const clientInspector = new HttpInspector({ id, side: "client", captureDir: this.captureDir, emit: (event) => this.handleObservedEvent(context, event) });
-    const upstreamInspector = new HttpInspector({ id, side: "upstream", captureDir: this.captureDir, emit: (event) => this.handleObservedEvent(context, event) });
+    const clientInspector = new HttpInspector({ id, side: "client", bodyDir: this.tempDir, emit: (event) => this.handleObservedEvent(context, event) });
+    const upstreamInspector = new HttpInspector({ id, side: "upstream", bodyDir: this.tempDir, emit: (event) => this.handleObservedEvent(context, event) });
 
     this.emit("connection", { id, scheme, remote: `${client.remoteAddress}:${client.remotePort}` });
 
@@ -119,7 +144,8 @@ export class ProxyService extends EventEmitter {
         const { method, target } = parseRequestLine(request.startLine);
         if (method === "POST" && target.startsWith("/aibi/voice/detectintent")) {
           const response = await this.buildLocalDetectIntentResponse({ request, target });
-          client.write(response);
+          if (response) client.write(response);
+          else if (!upstream.destroyed) upstream.write(request.raw);
         } else if (method === "GET" && target.startsWith("/aibi/chat/start")) {
           const response = await this.buildLocalProactiveResponse({ target });
           client.write(response);
@@ -159,8 +185,8 @@ export class ProxyService extends EventEmitter {
   wireHttpConnection(client) {
     const id = this.nextConnectionId++;
     const context = { id, scheme: "http" };
-    const clientInspector = new HttpInspector({ id, side: "client", captureDir: this.captureDir, emit: (event) => this.handleObservedEvent(context, event) });
-    const upstreamInspector = new HttpInspector({ id, side: "upstream", captureDir: this.captureDir, emit: (event) => this.handleObservedEvent(context, event) });
+    const clientInspector = new HttpInspector({ id, side: "client", bodyDir: this.tempDir, emit: (event) => this.handleObservedEvent(context, event) });
+    const upstreamInspector = new HttpInspector({ id, side: "upstream", bodyDir: this.tempDir, emit: (event) => this.handleObservedEvent(context, event) });
     let clientBuffer = Buffer.alloc(0);
     const upstream = net.connect({ host: "api.aibipocket.com", port: 80 });
 
@@ -219,7 +245,8 @@ export class ProxyService extends EventEmitter {
   handleObservedEvent(context, event) {
     if (event.side === "client" && event.kind === "request") context.pendingRequests?.push(event);
     const matchedRequest = event.side === "upstream" && event.kind === "response" ? context.pendingRequests?.shift() : null;
-    this.recordHttpEvent(event);
+    const storedEvent = this.recordHttpEvent(event);
+    if (storedEvent) this.emit("stored_event", storedEvent);
     this.emit("http_message", event);
 
     if (event.side === "client" && event.kind === "request" && event.startLine.includes("/aibi/voice/detectintent")) {
@@ -241,14 +268,13 @@ export class ProxyService extends EventEmitter {
         this.emit("conversation", {
           type: "proactive_reachout",
           title: "Proactive reachout",
-          detail: "Robot started a conversation",
+          detail: "AIBI started a conversation",
           payload: { ttsUrl: json.url, responseTag: json.responsetag || "", request: matchedRequest.startLine },
         });
         return;
       }
 
       if (json?.queryResult) {
-        this.store.learnFromDetectIntent(json);
         const summary = summarizeDetectIntent(json);
         const chatEvent = getChatModeEvent(summary);
         if (chatEvent) {
@@ -307,7 +333,7 @@ export class ProxyService extends EventEmitter {
     this.store.addEvent({
       type: "firmware_capture",
       title: localFirmware ? "OTA response replaced" : "OTA response trapped",
-      detail: localFirmware ? `Serving ${localFirmware.relativePath}` : (urls.length ? `${urls.length} firmware URL(s) captured and hidden from robot` : "OTA response captured; no firmware URL found"),
+      detail: localFirmware ? `Serving ${localFirmware.relativePath}` : (urls.length ? `${urls.length} firmware URL(s) captured and hidden from AIBI` : "OTA response captured; no firmware URL found"),
       payload: {
         request: request.startLine,
         urls,
@@ -398,20 +424,19 @@ export class ProxyService extends EventEmitter {
   recordHttpEvent(event) {
     try {
       if (event.type === "http_parse_error") {
-        this.store.addEvent({
+        return this.store.addEvent({
           type: "warning",
           title: "HTTP parser skipped a message",
           detail: event.error,
           payload: event,
         });
-        return;
       }
 
       const body = event.body;
       const detail = body?.kind === "text"
         ? body.text.slice(0, 500)
         : body?.filePath || "";
-      this.store.addEvent({
+      return this.store.addEvent({
         type: "http_message",
         title: event.startLine,
         detail,
@@ -424,15 +449,21 @@ export class ProxyService extends EventEmitter {
 
   async buildLocalDetectIntentResponse({ request, target }) {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const audioPath = path.join(this.captureDir, `local-${id}.bin`);
-    fs.writeFileSync(audioPath, request.body);
     const settings = this.getSettings();
     const query = new URL(`http://local${target}`).searchParams;
     const requestChatMode = query.get("role") === "chatgpt" || this.chatMode;
     const modelInfo = this.store.getOpenRouterModel(settings.openRouterModel);
     const preparedAudio = prepareAudio(request.body);
     const audioFormat = preparedAudio.format;
-    const useNativeAudio = supportsModality(modelInfo, "input", "audio") && Boolean(audioFormat);
+    const userMedia = preparedAudio.buffer?.length && audioFormat
+      ? [this.saveChatMedia({
+          buffer: preparedAudio.buffer,
+          type: "audio",
+          mimeType: audioMimeType(audioFormat),
+          extension: audioFormat,
+          label: "User",
+        })]
+      : [];
 
     if (requestChatMode && audioLooksSilent(request.body)) {
       const responseJson = await this.buildProtocolResponseFromIntent({
@@ -456,36 +487,37 @@ export class ProxyService extends EventEmitter {
       return responseBuffer("HTTP/1.1 200 OK", responseJson);
     }
 
+    const capabilities = getCapabilities(this.getSettings());
     let transcript = "";
-    if (!useNativeAudio && audioFormat) {
-      try {
-        const sttPath = preparedAudio.buffer === request.body ? audioPath : path.join(this.captureDir, `local-${id}.${audioFormat}`);
-        if (preparedAudio.buffer !== request.body) fs.writeFileSync(sttPath, preparedAudio.buffer);
-        transcript = await this.fishAudio.transcribe(sttPath);
-      } catch (error) {
-        this.emitDetailedError({ id, side: "fish-audio", error });
-      }
-    }
-
-    const capabilities = buildCapabilities(this.store.getLearned());
     let localError = false;
+    let userContent = "";
     let intent = {
-      speech: { text: settings.localTextFallback || "I heard you.", listen: 0 },
+      speech: { text: settings.localTextFallback, listen: 0 },
       mode: { chat: "unchanged" },
       action: { behavior: "" },
       recognition: { enabled: false },
       animation: { pre: "", post: "", post_behavior: "" },
     };
     try {
-      intent = await this.openRouter.generateLocalIntent({
-        transcript,
+      const turn = await this.openRouter.generateLocalIntent({
         audio: preparedAudio.buffer,
         audioFormat,
         capabilities,
         history: this.chatHistory,
         chatMode: requestChatMode,
         modelInfo,
+        transcribeAudio: async ({ audio, audioFormat: format }) => {
+          try {
+            return await this.transcribeAudioBuffer({ id, audio, audioFormat: format });
+          } catch (error) {
+            this.emitDetailedError({ id, side: "fish-audio", error });
+            return "";
+          }
+        },
       });
+      intent = turn.intent;
+      transcript = turn.inputText;
+      userContent = formatChatContentForLog(turn.latestUserContent || turn.inputText);
     } catch (error) {
       localError = true;
       this.emitDetailedError({ id, side: "openrouter", error });
@@ -504,11 +536,11 @@ export class ProxyService extends EventEmitter {
       index: Number(query.get("index") || 0),
       modelInfo,
     });
-    this.rememberTurn({ transcript, responseJson });
+    this.rememberTurn({ transcript, responseJson, userContent, userMedia });
     this.emit("conversation", {
-      type: responseJson.queryResult?.rec_behavior === "interact_speak" ? "local_response" : "action",
-      title: responseJson.queryResult?.behavior_paras?.txt || responseJson.queryResult?.rec_behavior || "Local response",
-      detail: transcript || "Local replacement generated a response",
+      type: responseJson.queryResult?.rec_behavior === "interact_speak" ? "override_response" : "action",
+      title: responseJson.queryResult?.behavior_paras?.txt || responseJson.queryResult?.rec_behavior || "Override response",
+      detail: transcript || "Override generated a response",
       payload: summarizeDetectIntent(responseJson),
     });
     return responseBuffer("HTTP/1.1 200 OK", responseJson);
@@ -516,7 +548,8 @@ export class ProxyService extends EventEmitter {
 
   async buildLocalProactiveResponse() {
     const modelInfo = this.store.getOpenRouterModel(this.getSettings().openRouterModel);
-    const capabilities = buildCapabilities(this.store.getLearned());
+    const capabilities = getCapabilities(this.getSettings());
+    const stageDirections = ["You decided to proactively reach out to the user."];
     let intent = {
       speech: { text: "Hi, want to chat for a bit?", listen: 0 },
       mode: { chat: "unchanged" },
@@ -525,22 +558,22 @@ export class ProxyService extends EventEmitter {
       animation: { pre: "", post: "", post_behavior: "" },
     };
     try {
-      intent = await this.openRouter.generateLocalIntent({
-        transcript: "Start a short proactive conversation with the user.",
+      const turn = await this.openRouter.generateLocalIntent({
         capabilities,
         history: this.chatHistory,
         chatMode: this.chatMode,
         modelInfo,
-        proactive: true,
+        stageDirections,
+        responseMode: "speech",
       });
+      intent = turn.intent;
     } catch (error) {
       this.emitDetailedError({ id: "proactive", side: "openrouter", error });
     }
     const text = intent.speech?.text || this.getSettings().localTextFallback || "Hi there.";
-    const ttsUrl = this.queueLocalTts({ text, modelInfo });
+    const ttsUrl = await this.queueLocalTtsReady({ text, modelInfo });
     const responseJson = buildProactiveChatResponse({ ttsUrl });
-    this.chatHistory.push({ role: "assistant", content: text });
-    this.trimChatHistory();
+    this.addChatTurn({ userContent: formatStageHistory(stageDirections), assistantText: text, assistantTtsUrl: ttsUrl });
     this.emit("conversation", {
       type: "proactive_reachout",
       title: "Proactive reachout",
@@ -563,7 +596,7 @@ export class ProxyService extends EventEmitter {
     if (method === "POST" && pathname === "/aibi/report/status") {
       this.emit("conversation", {
         type: "robot_status",
-        title: "Robot status",
+        title: "AIBI status",
         detail: summarizeStatusPayload(request.body, request.headers),
         payload: summarizeRequestBody(request.body, request.headers),
       });
@@ -583,14 +616,31 @@ export class ProxyService extends EventEmitter {
     }
 
     if (method === "GET" && pathname === "/aibi/poweron/voice") {
-      const text = settings.localTextFallback || "Hi.";
-      const ttsUrl = this.queueLocalTts({ text, modelInfo }).replace("/tts/dl/", "/poweron/dl/");
+      const stageDirections = ["You just powered on again."];
+      let text = POWER_ON_TEXT;
+      if (settings.openRouterApiKey) {
+        try {
+          const turn = await this.openRouter.generateLocalIntent({
+            capabilities: getCapabilities(this.getSettings()),
+            history: this.chatHistory,
+            chatMode: this.chatMode,
+            modelInfo,
+            stageDirections,
+            responseMode: "speech",
+          });
+          text = turn.intent.speech?.text || text;
+        } catch (error) {
+          this.emitDetailedError({ id: "poweron", side: "openrouter", error });
+        }
+      }
+      const ttsUrl = (await this.queueLocalTtsReady({ text, modelInfo })).replace("/tts/dl/", "/poweron/dl/");
+      this.addChatTurn({ userContent: formatStageHistory(stageDirections), assistantText: text, assistantTtsUrl: ttsUrl });
       return responseBuffer("HTTP/1.1 200 OK", okTagged("poweronvoice", { url: ttsUrl }));
     }
 
     if (method === "GET" && pathname === "/aibi/speech/tts") {
       const text = url.searchParams.get("q") || settings.localTextFallback || "OK.";
-      const ttsUrl = this.queueLocalTts({ text, modelInfo });
+      const ttsUrl = await this.queueLocalTtsReady({ text, modelInfo });
       return responseBuffer("HTTP/1.1 200 OK", okTagged("tts", { url: ttsUrl }));
     }
 
@@ -610,12 +660,22 @@ export class ProxyService extends EventEmitter {
 
     if (method === "POST" && pathname === "/aibi/ai/imgrecog") {
       const imageMimeType = guessImageMimeType(request.body);
-      const canUseImage = supportsModality(modelInfo, "input", "image");
-      const capabilities = buildCapabilities(this.store.getLearned());
-      let transcript = canUseImage ? "The user sent an image." : "";
+      const userMedia = request.body?.length
+        ? [this.saveChatMedia({
+            buffer: request.body,
+            type: "image",
+            mimeType: imageMimeType,
+            extension: imageExtension(imageMimeType),
+            label: "AIBI camera image",
+          })]
+        : [];
+      const capabilities = getCapabilities(this.getSettings());
+      const stageDirections = ["User sent a image."];
+      let transcript = "";
+      let userContent = "";
       let localError = false;
       let intent = {
-        speech: { text: settings.localTextFallback || "I heard you.", listen: 0 },
+        speech: { text: settings.localTextFallback, listen: 0 },
         mode: { chat: "unchanged" },
         action: { behavior: "" },
         recognition: { enabled: false },
@@ -623,19 +683,19 @@ export class ProxyService extends EventEmitter {
       };
 
       try {
-        if (!canUseImage) {
-          const description = await this.openRouter.describeImage({ image: request.body, mimeType: imageMimeType });
-          transcript = description ? `The user sent an image. Image description: ${description}` : "The user sent an image, but image description failed.";
-        }
-        intent = await this.openRouter.generateLocalIntent({
-          transcript,
-          image: canUseImage ? request.body : null,
+        const turn = await this.openRouter.generateLocalIntent({
+          image: request.body,
           imageMimeType,
           capabilities,
           history: this.chatHistory,
           chatMode: this.chatMode,
           modelInfo,
+          stageDirections,
+          responseMode: "speech",
         });
+        intent = turn.intent;
+        transcript = turn.inputText;
+        userContent = formatChatContentForLog(turn.latestUserContent || turn.inputText);
       } catch (error) {
         localError = true;
         this.emitDetailedError({ id: "image-recognition", side: "openrouter", error });
@@ -647,17 +707,16 @@ export class ProxyService extends EventEmitter {
           : { ...intent, speech: { text: "Error occurred.", listen: 0 } };
       }
 
-      const responseJson = await this.buildProtocolResponseFromIntent({
+      const responseJson = await this.buildImageRecognitionResponseFromIntent({
         intent,
         transcript,
-        index: 0,
         modelInfo,
       });
-      this.rememberTurn({ transcript, responseJson });
+      this.rememberTurn({ transcript, responseJson, userContent, userMedia });
       this.emit("conversation", {
-        type: responseJson.queryResult?.rec_behavior === "interact_speak" ? "local_response" : "action",
+        type: responseJson.queryResult?.rec_behavior === "interact_speak" ? "override_response" : "action",
         title: responseJson.queryResult?.behavior_paras?.txt || responseJson.queryResult?.rec_behavior || "Image response",
-        detail: canUseImage ? "Image sent to selected chat model" : "Image described by Gemini, then sent to selected chat model",
+        detail: "Image handled through the override path",
         payload: summarizeDetectIntent(responseJson),
       });
       return responseBuffer("HTTP/1.1 200 OK", responseJson);
@@ -675,6 +734,22 @@ export class ProxyService extends EventEmitter {
     return null;
   }
 
+  async buildImageRecognitionResponseFromIntent({ intent, transcript, modelInfo }) {
+    const text = intent.speech?.text || this.getSettings().localTextFallback || "I can't see much from that image.";
+    const ttsUrl = await this.queueLocalTtsReady({ text, modelInfo });
+    const response = buildSpeakResponse({
+      text,
+      ttsUrl,
+      queryText: transcript,
+      index: 0,
+      listen: intent.speech?.listen || 0,
+    });
+    response.queryResult.intent = { name: "chatgpt_speak", confidence: 1 };
+    response.queryResult.photo_type = "";
+    delete response.index;
+    return response;
+  }
+
   async buildProtocolResponseFromIntent({ intent, transcript, index, modelInfo }) {
     if (intent.mode?.chat === "connect") {
       this.chatMode = true;
@@ -688,7 +763,7 @@ export class ProxyService extends EventEmitter {
       return buildRecognizeResponse({ queryText: transcript, index });
     }
     const actionAfterSpeech = this.getSettings().actionAfterSpeech;
-    const postBehaviorNames = new Set(buildCapabilities().native_animations.post_behavior);
+    const postBehaviorNames = new Set(getCapabilities(this.getSettings()).native_animations.post_behavior);
     const canPostAction = actionAfterSpeech && postBehaviorNames.has(intent.action?.behavior);
     if (intent.action?.behavior && !canPostAction) {
       return buildActionResponse({ action: intent.action.behavior, params: actionParams(intent), queryText: transcript, index });
@@ -699,7 +774,7 @@ export class ProxyService extends EventEmitter {
       return buildActionResponse({ action: intent.action.behavior, params, queryText: transcript, index });
     }
     if (intent.speech?.text) {
-      const ttsUrl = this.queueLocalTts({ text: intent.speech.text, modelInfo });
+      const ttsUrl = await this.queueLocalTtsReady({ text: intent.speech.text, modelInfo });
       return buildSpeakResponse({
         text: intent.speech.text,
         ttsUrl,
@@ -713,8 +788,8 @@ export class ProxyService extends EventEmitter {
     }
     if (intent.recognition?.enabled) return buildRecognizeResponse({ queryText: transcript, index });
     if (intent.action?.behavior) return buildActionResponse({ action: intent.action.behavior, params: actionParams(intent), queryText: transcript, index });
-    const fallbackText = this.getSettings().localTextFallback || "I heard you.";
-    const fallbackTtsUrl = this.queueLocalTts({ text: fallbackText, modelInfo });
+    const fallbackText = this.getSettings().localTextFallback;
+    const fallbackTtsUrl = await this.queueLocalTtsReady({ text: fallbackText, modelInfo });
     return buildSpeakResponse({
       text: fallbackText,
       ttsUrl: fallbackTtsUrl,
@@ -723,56 +798,187 @@ export class ProxyService extends EventEmitter {
     });
   }
 
-  queueLocalTts({ text, modelInfo }) {
-    const ttsId = this.ttsCache.reserve();
-    this.generateLocalTts({ id: ttsId, text, modelInfo });
+  async queueLocalTtsReady({ text, modelInfo }) {
+    const ttsId = `local-${crypto.randomUUID()}.mp3`;
+    try {
+      const stream = await this.openLocalTtsStream({ text, modelInfo });
+      const iterator = toAsyncIterable(stream)[Symbol.asyncIterator]();
+      const first = await withTimeout(iterator.next(), 15000);
+      if (first.done) throw new Error("tts_stream_empty");
+      this.pendingTtsStreams.set(ttsId, {
+        iterator,
+        firstChunk: Buffer.from(first.value),
+        contentType: "audio/mpeg",
+        expiresAt: Date.now() + 120000,
+      });
+    } catch (error) {
+      this.emitDetailedError({ id: "tts", side: "fish-audio", error });
+      this.pendingTtsStreams.set(ttsId, {
+        error,
+        contentType: "audio/mpeg",
+        expiresAt: Date.now() + 120000,
+      });
+    }
+    setTimeout(() => this.pendingTtsStreams.delete(ttsId), 120000).unref?.();
     return `http://api.aibipocket.com/tts/dl/${ttsId}`;
   }
 
-  async generateLocalTts({ id, text, modelInfo }) {
-    let audio = null;
-    if (supportsModality(modelInfo, "output", "audio")) {
-      try {
-        audio = await this.openRouter.synthesizeSpeechStream({ text });
-      } catch (error) {
-        this.emitDetailedError({ id: "tts", side: "openrouter", error });
-      }
-    }
-    if (!audio) {
-      try {
-        audio = await this.fishAudio.synthesizeToStream({ text });
-      } catch (error) {
-        this.emitDetailedError({ id: "tts", side: "fish-audio", error });
-      }
-    }
-    if (!audio) {
-      this.ttsCache.fail(id, new Error("tts_generation_failed"));
-      return;
-    }
-    this.ttsCache.fulfill(id, audio);
+  async openLocalTtsStream({ text }) {
+    const audio = await this.fishAudio.synthesizeToStream({ text });
+    if (!audio) throw new Error("tts_generation_failed");
+    return audio;
   }
 
-  rememberTurn({ transcript, responseJson }) {
-    if (transcript) this.chatHistory.push({ role: "user", content: transcript });
+  async transcribeAudioBuffer({ id, audio, audioFormat }) {
+    const extension = audioFormat || "bin";
+    const sttPath = path.join(this.tempDir, `local-${id}.${extension}`);
+    fs.writeFileSync(sttPath, audio);
+    return this.fishAudio.transcribe(sttPath);
+  }
+
+  rememberTurn({ transcript, responseJson, userContent = "", userMedia = [] }) {
+    const userText = userContent || transcript;
+    if (userText || userMedia.length) this.addChatMessage("user", userText, { media: userMedia });
     const text = responseJson.queryResult?.behavior_paras?.txt;
-    if (text) this.chatHistory.push({ role: "assistant", content: text });
+    const ttsUrl = responseJson.queryResult?.behavior_paras?.url;
+    if (text) this.addChatMessage("assistant", text, { ttsUrl }, ttsUrl);
+  }
+
+  addChatTurn({ userContent, assistantText, assistantTtsUrl = "", userMedia = [] }) {
+    if (userContent || userMedia.length) this.addChatMessage("user", userContent, { media: userMedia });
+    if (assistantText) this.addChatMessage("assistant", assistantText, { ttsUrl: assistantTtsUrl }, assistantTtsUrl);
+  }
+
+  addChatMessage(role, content, payload = {}, ttsUrl = "") {
+    const row = this.store.addChatMessage({ role, content, payload });
+    this.chatHistory.push(chatMessageToHistoryItem(row));
     this.trimChatHistory();
+    this.emit("chat_message", row);
+    const ttsId = ttsUrl ? path.basename(new URL(ttsUrl, "http://local").pathname) : "";
+    if (ttsId) this.registerTtsLogTarget(ttsId, row.id);
+    return row;
+  }
+
+  registerTtsLogTarget(ttsId, messageId) {
+    this.ttsLogTargets.set(ttsId, messageId);
+    const pending = this.pendingTtsMedia.get(ttsId);
+    if (pending) {
+      this.pendingTtsMedia.delete(ttsId);
+      const media = this.saveChatMedia({
+        buffer: pending.body,
+        type: "audio",
+        mimeType: pending.mimeType,
+        extension: mediaExtension(pending.mimeType),
+        label: "AIBI",
+      });
+      this.appendChatMessageMedia(messageId, media);
+    }
   }
 
   trimChatHistory() {
     this.chatHistory = this.chatHistory.slice(-24);
   }
 
-  resetChatHistory({ emitEvent = true } = {}) {
-    const cleared = this.chatHistory.length;
+  refreshChatHistory() {
+    this.chatHistory = this.store.getChatMessages().map(chatMessageToHistoryItem).filter(Boolean).slice(-24);
+  }
+
+  getChatLog() {
+    return this.store.getChatMessages();
+  }
+
+  updateChatMessage(id, content) {
+    const row = this.store.updateChatMessage(id, content);
+    this.refreshChatHistory();
+    if (row) this.emit("chat_message", row);
+    return row;
+  }
+
+  deleteChatMessage(id) {
+    const row = this.store.deleteChatMessage(id);
+    if (row) {
+      this.deleteChatMessageMedia(row);
+      this.refreshChatHistory();
+      this.emit("chat_message_deleted", { id: row.id });
+    }
+    return row;
+  }
+
+  clearChatLog() {
+    const { rows, cleared } = this.store.clearChatMessages();
+    for (const row of rows) this.deleteChatMessageMedia(row);
+    fs.rmSync(this.chatMediaDir, { recursive: true, force: true });
+    fs.mkdirSync(this.chatMediaDir, { recursive: true });
     this.chatHistory = [];
-    if (emitEvent) this.emit("conversation", {
-      type: "mode",
-      title: "Chat history reset",
-      detail: `${cleared} messages cleared`,
-      payload: { cleared },
-    });
+    this.ttsLogTargets.clear();
+    this.pendingTtsMedia.clear();
+    this.emit("chat_log_cleared", { cleared });
     return { cleared };
+  }
+
+  saveChatMedia({ buffer, type, mimeType, extension, label }) {
+    const safeExtension = String(extension || mediaExtension(mimeType) || "bin").replace(/[^a-zA-Z0-9]/g, "") || "bin";
+    const filename = `${Date.now()}-${crypto.randomUUID()}.${safeExtension}`;
+    const filePath = path.join(this.chatMediaDir, filename);
+    fs.writeFileSync(filePath, buffer);
+    return {
+      type,
+      label,
+      mimeType,
+      path: `chat-media/${filename}`,
+      bytes: buffer.length,
+    };
+  }
+
+  captureTtsForChat(ttsId, body, mimeType) {
+    const messageId = this.ttsLogTargets.get(ttsId);
+    if (messageId) {
+      const media = this.saveChatMedia({
+        buffer: body,
+        type: "audio",
+        mimeType,
+        extension: mediaExtension(mimeType),
+        label: "AIBI",
+      });
+      this.appendChatMessageMedia(messageId, media);
+      return;
+    }
+    this.pendingTtsMedia.set(ttsId, { body, mimeType });
+    setTimeout(() => this.pendingTtsMedia.delete(ttsId), 120000).unref?.();
+  }
+
+  appendChatMessageMedia(messageId, media) {
+    const row = this.store.getChatMessage(messageId);
+    if (!row) return null;
+    const payload = row.payload || {};
+    payload.media = [...(payload.media || []), media];
+    const updated = this.store.updateChatMessagePayload(messageId, payload);
+    if (updated) this.emit("chat_message", updated);
+    return updated;
+  }
+
+  deleteChatMessageMedia(row) {
+    for (const media of row?.payload?.media || []) {
+      this.deleteChatMediaFile(media.path);
+    }
+  }
+
+  deleteChatMediaFile(relativePath) {
+    const safePath = safeMediaPath(this.rootDir, relativePath);
+    if (!safePath) return;
+    fs.rmSync(safePath, { force: true });
+  }
+
+  getChatMedia(relativePath) {
+    const safePath = safeMediaPath(this.rootDir, relativePath);
+    if (!safePath || !fs.existsSync(safePath)) {
+      throw new Error("chat_media_not_found");
+    }
+    const body = fs.readFileSync(safePath);
+    return {
+      contentType: mimeTypeFromPath(safePath),
+      data: body.toString("base64"),
+    };
   }
 
   emitDetailedError({ id, side, error }) {
@@ -783,46 +989,29 @@ export class ProxyService extends EventEmitter {
 
   async serveLocalTts(client, id) {
     const clean = path.basename(id);
-    try {
-      const cached = await this.ttsCache.takeWhenReady(clean);
-      if (!cached) throw new Error("tts_not_found");
-      if (Buffer.isBuffer(cached.body)) {
-        writeAudioResponse(client, cached.body, cached.contentType);
-      } else {
-        await writeAudioStreamResponse(client, cached.body, cached.contentType);
-      }
-      return;
-    } catch {
-      // Fall through to old on-disk cache for files from earlier runs.
-    }
-
-    const filePath = path.join(this.ttsDir, clean);
-    if (!fs.existsSync(filePath)) {
+    const pending = this.pendingTtsStreams.get(clean);
+    if (!pending || pending.expiresAt < Date.now()) {
+      this.pendingTtsStreams.delete(clean);
       client.write(responseBuffer("HTTP/1.1 404 Not Found", { error: "tts_not_found" }, { Connection: "close" }));
       return;
     }
+    if (pending.error) {
+      this.pendingTtsStreams.delete(clean);
+      client.write(responseBuffer("HTTP/1.1 502 Bad Gateway", { error: "tts_generation_failed" }, { Connection: "close" }));
+      return;
+    }
 
-    const body = fs.readFileSync(filePath);
-    writeAudioResponse(client, body, "audio/mpeg");
+    this.pendingTtsStreams.delete(clean);
+    const chunks = [];
+    await writeLiveTtsResponse(client, pending, (chunk) => chunks.push(Buffer.from(chunk)));
+    if (chunks.length) this.captureTtsForChat(clean, Buffer.concat(chunks), pending.contentType);
   }
 }
 
-function writeAudioResponse(client, body, contentType) {
+async function writeLiveTtsResponse(client, pending, recordChunk) {
   const headers = [
     "HTTP/1.1 200 OK",
-    `Content-Type: ${contentType}`,
-    `Content-Length: ${body.length}`,
-    "Connection: close",
-    "",
-    "",
-  ].join("\r\n");
-  client.end(Buffer.concat([Buffer.from(headers, "utf8"), body]));
-}
-
-async function writeAudioStreamResponse(client, stream, contentType) {
-  const headers = [
-    "HTTP/1.1 200 OK",
-    `Content-Type: ${contentType}`,
+    `Content-Type: ${pending.contentType}`,
     "Transfer-Encoding: chunked",
     "Connection: close",
     "",
@@ -831,12 +1020,17 @@ async function writeAudioStreamResponse(client, stream, contentType) {
   client.write(headers);
 
   try {
-    for await (const chunk of toAsyncIterable(stream)) {
-      if (!chunk?.length) continue;
-      const buffer = Buffer.from(chunk);
-      client.write(Buffer.from(`${buffer.length.toString(16)}\r\n`, "ascii"));
-      client.write(buffer);
-      client.write(Buffer.from("\r\n", "ascii"));
+    if (pending.firstChunk?.length) {
+      writeChunk(client, pending.firstChunk);
+      recordChunk(pending.firstChunk);
+    }
+    while (true) {
+      const next = await pending.iterator.next();
+      if (next.done) break;
+      const chunk = Buffer.from(next.value);
+      if (!chunk.length) continue;
+      writeChunk(client, chunk);
+      recordChunk(chunk);
     }
     client.end("0\r\n\r\n");
   } catch (error) {
@@ -844,10 +1038,32 @@ async function writeAudioStreamResponse(client, stream, contentType) {
   }
 }
 
+function writeChunk(client, buffer) {
+  client.write(Buffer.from(`${buffer.length.toString(16)}\r\n`, "ascii"));
+  client.write(buffer);
+  client.write(Buffer.from("\r\n", "ascii"));
+}
+
 function toAsyncIterable(stream) {
   if (stream?.[Symbol.asyncIterator]) return stream;
   if (stream?.getReader) return readWebStream(stream);
   return readWebStream(new Response(stream).body);
+}
+
+function withTimeout(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("tts_stream_timeout")), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function* readWebStream(stream) {
@@ -863,20 +1079,20 @@ async function* readWebStream(stream) {
   }
 }
 
-function buildCapabilities(learned) {
-  const nativeBehaviors = [...new Set(FIRMWARE_BEHAVIORS)]
-    .filter((name) => name && !["interact_speak", "interact_answer_with_animation"].includes(name))
-    .sort();
-  return {
-    native_behaviors: nativeBehaviors,
-    action_param_schemas: FIRMWARE_ACTION_PARAMS,
-    firmware_animation_names: FIRMWARE_ANIMATIONS,
-    native_animations: {
-      pre_animation: FIRMWARE_ANIMATIONS,
-      post_animation: FIRMWARE_ANIMATIONS,
-      post_behavior: nativeBehaviors,
-    },
-  };
+function chatMessageToHistoryItem(row) {
+  if (!row?.role || !row.content) return null;
+  return { role: row.role, content: row.content };
+}
+
+function formatChatContentForLog(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    if (part?.type === "text") return part.text || "";
+    if (part?.type === "image_url") return "[image attached]";
+    if (part?.type === "input_audio") return "[audio attached]";
+    return "";
+  }).filter(Boolean).join("\n");
 }
 
 function coerceUpdateIntent(intent) {
@@ -907,6 +1123,10 @@ function actionParams(intent) {
   return intent.action?.params && Object.keys(intent.action.params).length ? intent.action.params : [];
 }
 
+function formatStageHistory(stageDirections = []) {
+  return stageDirections.map((value) => `[${String(value).replace(/^\[|\]$/g, "")}]`).join("\n");
+}
+
 function guessAudioFormat(buffer) {
   if (!buffer?.length) return "";
   if (buffer.subarray(0, 3).toString("ascii") === "ID3") return "mp3";
@@ -922,6 +1142,52 @@ function guessImageMimeType(buffer) {
   if (buffer?.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
   if (buffer?.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
   return "image/jpeg";
+}
+
+function audioMimeType(format) {
+  if (format === "mp3") return "audio/mpeg";
+  if (format === "wav") return "audio/wav";
+  if (format === "ogg") return "audio/ogg";
+  if (format === "m4a") return "audio/mp4";
+  return "application/octet-stream";
+}
+
+function imageExtension(mimeType) {
+  if (mimeType === "image/png") return "png";
+  if (mimeType === "image/webp") return "webp";
+  return "jpg";
+}
+
+function mediaExtension(mimeType = "") {
+  if (mimeType.includes("mpeg")) return "mp3";
+  if (mimeType.includes("wav")) return "wav";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("png")) return "png";
+  if (mimeType.includes("webp")) return "webp";
+  if (mimeType.includes("jpeg") || mimeType.includes("jpg")) return "jpg";
+  return "bin";
+}
+
+function mimeTypeFromPath(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".mp3") return "audio/mpeg";
+  if (extension === ".wav") return "audio/wav";
+  if (extension === ".ogg") return "audio/ogg";
+  if (extension === ".m4a") return "audio/mp4";
+  if (extension === ".png") return "image/png";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  return "application/octet-stream";
+}
+
+function safeMediaPath(rootDir, relativePath) {
+  if (!relativePath || typeof relativePath !== "string") return "";
+  const normalized = relativePath.replace(/\\/g, "/");
+  if (!normalized.startsWith("chat-media/")) return "";
+  const resolved = path.resolve(rootDir, normalized);
+  const mediaRoot = path.resolve(rootDir, "chat-media");
+  return resolved === mediaRoot || resolved.startsWith(`${mediaRoot}${path.sep}`) ? resolved : "";
 }
 
 function summarizeRequestBody(body, headers = {}) {

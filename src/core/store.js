@@ -1,21 +1,24 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
-import { FIRMWARE_ANIMATIONS, FIRMWARE_BEHAVIORS } from "./firmwareCapabilities.js";
 
 const DEFAULT_SETTINGS = {
-  mode: "passthrough",
+  mode: "local",
   openRouterApiKey: "",
   openRouterModel: "openai/gpt-5-mini",
   fishApiKey: "",
   fishVoiceId: "",
   fishModel: "s2-pro",
   language: "en",
-  localTextFallback: "I heard you.",
+  personalityPrompt: "You are AIBI: warm, curious, playful, and concise. You feel like a small embodied desktop companion, not a generic assistant.",
+  localTextFallback: "A error has occured.",
   actionAfterSpeech: false,
+  disabledCapabilityIds: ["interact_mood"],
+  disabledAnimationIds: [],
 };
 
 export class AppStore {
   constructor({ rootDir }) {
+    this.rootDir = rootDir;
     this.db = new DatabaseSync(path.join(rootDir, "aibi.sqlite"));
     this.init();
   }
@@ -39,19 +42,12 @@ export class AppStore {
         payload TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS behaviors (
-        name TEXT PRIMARY KEY,
-        intent_name TEXT,
-        sample_payload TEXT NOT NULL,
-        seen_count INTEGER NOT NULL DEFAULT 1,
-        last_seen_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS animations (
-        name TEXT PRIMARY KEY,
-        field TEXT NOT NULL,
-        seen_count INTEGER NOT NULL DEFAULT 1,
-        last_seen_at TEXT NOT NULL
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        payload TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS openrouter_models (
@@ -73,6 +69,7 @@ export class AppStore {
     this.addColumnIfMissing("openrouter_models", "input_modalities", "TEXT");
     this.addColumnIfMissing("openrouter_models", "output_modalities", "TEXT");
     this.addColumnIfMissing("openrouter_models", "supported_parameters", "TEXT");
+    this.dropLegacyCapabilityTables();
 
     const settings = this.getSettings();
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
@@ -85,6 +82,13 @@ export class AppStore {
     if (!columns.some((row) => row.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     }
+  }
+
+  dropLegacyCapabilityTables() {
+    this.db.exec(`
+      DROP TABLE IF EXISTS behaviors;
+      DROP TABLE IF EXISTS animations;
+    `);
   }
 
   getSettings() {
@@ -143,68 +147,53 @@ export class AppStore {
     return result.changes || 0;
   }
 
-  learnFromDetectIntent(responseJson) {
-    const result = responseJson?.queryResult;
-    if (!result?.rec_behavior) return;
-
-    const now = new Date().toISOString();
-    this.db
-      .prepare(`
-        INSERT INTO behaviors (name, intent_name, sample_payload, seen_count, last_seen_at)
-        VALUES (?, ?, ?, 1, ?)
-        ON CONFLICT(name) DO UPDATE SET
-          intent_name = excluded.intent_name,
-          sample_payload = excluded.sample_payload,
-          seen_count = seen_count + 1,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(result.rec_behavior, result.intent?.name || "", JSON.stringify(result), now);
-
-    const params = result.behavior_paras && !Array.isArray(result.behavior_paras) ? result.behavior_paras : {};
-    for (const field of ["pre_animation", "post_animation", "post_behavior"]) {
-      if (params[field]) this.learnAnimation(field, params[field], now);
-    }
-  }
-
-  learnAnimation(field, name, now = new Date().toISOString()) {
-    this.db
-      .prepare(`
-        INSERT INTO animations (name, field, seen_count, last_seen_at)
-        VALUES (?, ?, 1, ?)
-        ON CONFLICT(name) DO UPDATE SET
-          field = excluded.field,
-          seen_count = seen_count + 1,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(name, field, now);
-  }
-
-  getLearned() {
-    const observedBehaviors = this.db.prepare("SELECT * FROM behaviors").all();
-    const observedAnimations = this.db.prepare("SELECT * FROM animations").all();
-    const behaviorRows = mergeNamedRows(
-      observedBehaviors,
-      FIRMWARE_BEHAVIORS.map((name) => ({
-        name,
-        intent_name: "",
-        sample_payload: JSON.stringify({ source: "firmware" }),
-        seen_count: 0,
-        last_seen_at: "",
-      })),
-    );
-    const animationRows = mergeNamedRows(
-      observedAnimations,
-      FIRMWARE_ANIMATIONS.map((name) => ({
-        name,
-        field: "firmware_animation",
-        seen_count: 0,
-        last_seen_at: "",
-      })),
-    );
-    return {
-      behaviors: behaviorRows.sort((a, b) => a.name.localeCompare(b.name)),
-      animations: animationRows.sort((a, b) => a.name.localeCompare(b.name)),
+  addChatMessage(message) {
+    const row = {
+      created_at: new Date().toISOString(),
+      role: message.role,
+      content: message.content || "",
+      payload: JSON.stringify(message.payload || {}),
     };
+    const result = this.db
+      .prepare("INSERT INTO chat_messages (created_at, role, content, payload) VALUES (?, ?, ?, ?)")
+      .run(row.created_at, row.role, row.content, row.payload);
+    return { id: Number(result.lastInsertRowid), ...row, payload: message.payload || {} };
+  }
+
+  getChatMessages(limit = 200) {
+    return this.db
+      .prepare("SELECT * FROM chat_messages ORDER BY id DESC LIMIT ?")
+      .all(limit)
+      .reverse()
+      .map((row) => ({ ...row, payload: safeJsonParse(row.payload, {}) }));
+  }
+
+  getChatMessage(id) {
+    const row = this.db.prepare("SELECT * FROM chat_messages WHERE id = ?").get(id);
+    return row ? { ...row, payload: safeJsonParse(row.payload, {}) } : null;
+  }
+
+  updateChatMessage(id, content) {
+    this.db.prepare("UPDATE chat_messages SET content = ? WHERE id = ?").run(content || "", id);
+    return this.getChatMessage(id);
+  }
+
+  updateChatMessagePayload(id, payload) {
+    this.db.prepare("UPDATE chat_messages SET payload = ? WHERE id = ?").run(JSON.stringify(payload || {}), id);
+    return this.getChatMessage(id);
+  }
+
+  deleteChatMessage(id) {
+    const row = this.getChatMessage(id);
+    if (!row) return null;
+    this.db.prepare("DELETE FROM chat_messages WHERE id = ?").run(id);
+    return row;
+  }
+
+  clearChatMessages() {
+    const rows = this.getChatMessages(100000);
+    const result = this.db.prepare("DELETE FROM chat_messages").run();
+    return { rows, cleared: result.changes || 0 };
   }
 
   replaceOpenRouterModels(models) {
@@ -309,11 +298,12 @@ function parseJsonArray(value) {
   }
 }
 
-function mergeNamedRows(primaryRows, secondaryRows) {
-  const rowsByName = new Map();
-  for (const row of secondaryRows) rowsByName.set(row.name, row);
-  for (const row of primaryRows) rowsByName.set(row.name, row);
-  return [...rowsByName.values()];
+function safeJsonParse(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
 }
 
 function parseModelRow(row) {

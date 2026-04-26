@@ -1,4 +1,4 @@
-# AiBi API Notes
+# AIBI API Notes
 
 ## Host
 
@@ -64,7 +64,7 @@ Known no-update response:
 
 ### `POST /aibi/report/status`
 
-Reports robot status.
+Reports AIBI status.
 
 ### `GET /aibi/permission`
 
@@ -94,7 +94,7 @@ Local handling policy:
 - `POST /aibi/report/status` returns success and displays a summarized status event in the UI.
 - Message send/receive/confirm are friend-message endpoints. Send posts `to`, `text`, `avatar`, and `name`; receive returns `responsetag = "getmessage"` with `m_list`; confirm acknowledges read messages.
 - `GET /aibi/poweron/voice` and `GET /aibi/speech/tts` generate local TTS and serve it through the same streamed audio path used by local speech replies.
-- `POST /aibi/ai/imgrecog` is treated as a normal local chat turn. If the selected OpenRouter model supports image input, the image is sent directly with the normal robot system prompt and chat history. If it does not, `google/gemini-2.5-flash-lite` first describes the image, then that description is sent through the normal local chat path. The final response is stored in chat history and returned with local TTS.
+- `POST /aibi/ai/imgrecog` is treated as a normal local chat turn. If the selected OpenRouter model supports image input, the image is sent directly with the normal AIBI system prompt and chat history. If it does not, `google/gemini-2.5-flash-lite` first describes the image, then that description is sent through the normal local chat path. The final response is stored in chat history and returned with local TTS.
 - `POST /aibi/ai/rockpaper` is forwarded to the real server.
 - `GET /aibi/ota/version` returns local patched firmware metadata when a patched package exists.
 - `GET /aibi/ota/res/<version>` returns local success with no update payload.
@@ -229,7 +229,7 @@ Observed response:
 
 ### Conversation Turns
 
-After conversation mode is active, the robot keeps using the normal voice intent endpoint, with `role=chatgpt` added.
+After conversation mode is active, AIBI keeps using the normal voice intent endpoint, with `role=chatgpt` added.
 
 ```http
 POST /aibi/voice/detectintent?locale=<locale>&timezone=<tz>&lon=<lon>&lat=<lat>&languagecode=en&alwaysReply=1&index=<index>&role=chatgpt HTTP/1.1
@@ -266,7 +266,7 @@ Responses are usually normal `interact_speak` replies with a TTS URL.
 }
 ```
 
-The robot then fetches the returned `/tts/dl/<id>` URL.
+AIBI then fetches the returned `/tts/dl/<id>` URL.
 
 ### Local AI Intent Shape
 
@@ -288,7 +288,7 @@ The local replacement asks OpenRouter for strict JSON with this flat shape:
 
 Valid `chat_mode` values are `unchanged`, `connect`, and `quit`.
 
-The AI receives native behavior IDs from the extracted 1.6.0 firmware string table. Unknown behavior IDs are discarded before a response is sent to the robot.
+The AI receives native behavior IDs from the extracted 1.6.0 firmware string table. Unknown behavior IDs are discarded before a response is sent to AIBI.
 
 `pre_animation`, `post_animation`, and `post_behavior` are present in cloud `interact_speak` payloads, but those exact field names are not present in the 1.6.0 firmware string table. The local AI therefore leaves them empty until there is code-derived evidence for valid values.
 
@@ -306,7 +306,7 @@ Firmware strings show `interact_answer_with_animation` next to the `animation_na
 
 ### Local Response Selection
 
-The local proxy maps the AI intent to one robot response:
+The local proxy maps the AI intent to one AIBI response:
 
 - `chat_mode = connect` sends `ability_chatgpt` with `behavior_paras.type = "connect"`.
 - `chat_mode = quit` sends `ability_chatgpt` with `behavior_paras.type = "quit"`.
@@ -344,7 +344,7 @@ Observed after a `detectintent` request with `role=chatgpt`:
 In local mode, chat mode can end in two ways:
 
 - The AI returns `chat_mode = "quit"` for user phrases such as stop, goodbye, or end the conversation.
-- If the robot sends a chat-mode voice request and the raw mic audio looks silent, the proxy returns the same `ability_chatgpt` quit response without calling OpenRouter.
+- If AIBI sends a chat-mode voice request and the raw mic audio looks silent, the proxy returns the same `ability_chatgpt` quit response without calling OpenRouter.
 
 ## Proactive Chat Flow
 
@@ -366,7 +366,7 @@ Host: api.aibipocket.com
 }
 ```
 
-The robot then fetches the returned TTS URL.
+AIBI then fetches the returned TTS URL.
 
 This is similar to ChatGPT conversation mode because later voice turns may use `detectintent` with `role=chatgpt`, but the entry point is different:
 
@@ -377,7 +377,7 @@ This is similar to ChatGPT conversation mode because later voice turns may use `
 
 ### Step 1: Voice Intent
 
-The robot first sends a normal `POST /aibi/voice/detectintent?...`.
+AIBI first sends a normal `POST /aibi/voice/detectintent?...`.
 
 Observed response:
 
@@ -414,7 +414,7 @@ Body is binary image/camera data.
 
 ### Input Audio
 
-Observed robot voice uploads are headerless raw PCM. The local proxy treats raw voice audio as:
+Observed AIBI voice uploads are headerless raw PCM. The local proxy treats raw voice audio as:
 
 - 16 kHz
 - mono
@@ -424,7 +424,7 @@ For models with native audio input, the proxy wraps this PCM as WAV and sends it
 
 ### TTS Generation
 
-The robot fetches TTS through `/tts/dl/<id>`. In local mode the URL is generated immediately, while audio generation runs behind the cache entry.
+AIBI fetches TTS through `/tts/dl/<id>`. In override mode, the proxy opens the TTS stream before returning the URL, then streams audio through `/tts/dl/<id>`.
 
 TTS order:
 

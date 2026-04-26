@@ -1,10 +1,12 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, Menu } from "electron";
 import { fork } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
+
+app.disableHardwareAcceleration();
 
 let windowRef = null;
 let proxyChild = null;
@@ -21,7 +23,7 @@ function startProxyChild() {
   if (proxyChild && !proxyChild.killed) return;
 
   proxyChild = fork(path.join(rootDir, "src/core/proxyProcess.js"), [rootDir], {
-    execPath: process.env.AIBI_NODE || "/usr/bin/node",
+    execPath: process.env.AIBI_NODE || process.env.npm_node_execpath || "node",
     stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
 
@@ -74,19 +76,28 @@ function proxyCall(command, payload) {
 }
 
 async function createWindow() {
+  Menu.setApplicationMenu(null);
+
   windowRef = new BrowserWindow({
     width: 1220,
     height: 820,
     minWidth: 980,
     minHeight: 680,
-    title: "AiBi Console",
-    backgroundColor: "#f4efe6",
+    title: "AIBI Console",
+    frame: false,
+    autoHideMenuBar: true,
+    backgroundColor: "#0b1118",
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+
+  windowRef.once("ready-to-show", () => {
+    if (windowRef && !windowRef.isDestroyed()) windowRef.show();
   });
 
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -107,10 +118,22 @@ app.on("window-all-closed", async () => {
 });
 
 ipcMain.handle("aibi:snapshot", () => proxyCall("snapshot"));
-ipcMain.handle("aibi:history:reset", () => proxyCall("resetChatHistory"));
+ipcMain.handle("aibi:events:clear", () => proxyCall("clearEvents"));
+ipcMain.handle("aibi:chat:clear", () => proxyCall("clearChatLog"));
+ipcMain.handle("aibi:chat:update", (_event, payload) => proxyCall("updateChatMessage", payload));
+ipcMain.handle("aibi:chat:delete", (_event, id) => proxyCall("deleteChatMessage", id));
+ipcMain.handle("aibi:chat:media", (_event, path) => proxyCall("chatMedia", path));
 ipcMain.handle("aibi:settings:save", (_event, settings) => proxyCall("saveSettings", settings));
 ipcMain.handle("aibi:mode:set", (_event, mode) => proxyCall("setMode", mode));
 ipcMain.handle("aibi:models", () => proxyCall("models"));
 ipcMain.handle("aibi:models:refresh", () => proxyCall("refreshModels"));
 ipcMain.handle("aibi:proxy:start", () => proxyCall("start"));
 ipcMain.handle("aibi:proxy:stop", () => proxyCall("stop"));
+ipcMain.handle("aibi:window:minimize", () => windowRef?.minimize());
+ipcMain.handle("aibi:window:maximize-toggle", () => {
+  if (!windowRef) return false;
+  if (windowRef.isMaximized()) windowRef.unmaximize();
+  else windowRef.maximize();
+  return windowRef.isMaximized();
+});
+ipcMain.handle("aibi:window:close", () => windowRef?.close());

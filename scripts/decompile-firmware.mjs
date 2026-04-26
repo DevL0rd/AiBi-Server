@@ -4,8 +4,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-const DEFAULT_INPUT = "captures/firmware/analysis/1.6.0/-8114815/pocket.bin";
-const DEFAULT_OUT = "captures/firmware/decompiled/1.6.0";
+const DEFAULT_VERSION = "1.6.0";
+const DEFAULT_INPUT = "firmware/analysis/1.6.0/-8114815/pocket.bin";
+const DEFAULT_OUT = "firmware/decompiled/1.6.0";
+const DEFAULT_ZIP = "firmware/1.6.0.zip";
+const DEFAULT_ARCHIVE_ENTRY = "1.6.0/-8114815/pocket.bin";
+const LATEST_REPORT = "firmware/latest-firmware.json";
 const FOCUS_PATTERNS = [
   /aibi/i,
   /ota/i,
@@ -23,6 +27,8 @@ const FOCUS_PATTERNS = [
   /animation/i,
   /interact_/i,
   /ability_/i,
+  /function_/i,
+  /volume/i,
   /animal_/i,
   /Secret/i,
   /Authorization/i,
@@ -32,10 +38,17 @@ const FOCUS_PATTERNS = [
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const input = path.resolve(args.input || DEFAULT_INPUT);
-  const outDir = path.resolve(args.out || DEFAULT_OUT);
+  if (!args.noRefresh) refreshLatestFirmware();
+
+  const latest = readLatestFirmwareReport();
+  const version = String(args.version || latest.versionName || DEFAULT_VERSION);
+  const zipPath = path.resolve(args.zip || latest.filePath || DEFAULT_ZIP.replaceAll(DEFAULT_VERSION, version));
+  const archiveEntry = String(args.entry || DEFAULT_ARCHIVE_ENTRY.replaceAll(DEFAULT_VERSION, version));
+  const input = path.resolve(args.input || path.join("firmware", "analysis", archiveEntry));
+  const outDir = path.resolve(args.out || DEFAULT_OUT.replaceAll(DEFAULT_VERSION, version));
   const segmentDir = path.join(outDir, "segments");
   fs.mkdirSync(segmentDir, { recursive: true });
+  ensureInputImage({ input, zipPath, archiveEntry });
 
   const image = fs.readFileSync(input);
   const metadata = parseEspImage(image);
@@ -58,8 +71,51 @@ function main() {
 
   fs.writeFileSync(path.join(outDir, "README.md"), renderReadme(metadata), "utf8");
   console.log(`Wrote firmware analysis to ${outDir}`);
+  console.log(`Input: ${input}`);
+  console.log(`Firmware zip: ${zipPath}`);
   console.log(`Segments: ${metadata.segments.length}`);
   console.log(`Focused strings: ${strings.filter((entry) => FOCUS_PATTERNS.some((pattern) => pattern.test(entry.text))).length}`);
+}
+
+function refreshLatestFirmware() {
+  const result = spawnSync(process.execPath, [
+    path.resolve("scripts/find-latest-firmware.mjs"),
+  ], { stdio: "inherit" });
+
+  if (result.status !== 0) {
+    throw new Error(`Firmware refresh failed with exit code ${result.status}`);
+  }
+}
+
+function readLatestFirmwareReport() {
+  const reportPath = path.resolve(LATEST_REPORT);
+  if (!fs.existsSync(reportPath)) return {};
+  const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  return {
+    versionName: report.update?.versionName || report.update?.versionNum || "",
+    filePath: report.downloaded?.filePath || "",
+  };
+}
+
+function ensureInputImage({ input, zipPath, archiveEntry }) {
+  if (fs.existsSync(input)) return;
+  if (!fs.existsSync(zipPath)) {
+    throw new Error(`Input image missing and firmware zip not found: ${input}`);
+  }
+
+  fs.mkdirSync(path.dirname(input), { recursive: true });
+  const extractRoot = path.dirname(path.dirname(path.dirname(input)));
+  const result = spawnSync("tar", [
+    "-xf",
+    zipPath,
+    "-C",
+    extractRoot,
+    archiveEntry,
+  ], { encoding: "utf8" });
+
+  if (result.status !== 0 || !fs.existsSync(input)) {
+    throw new Error(`Could not extract ${archiveEntry} from ${zipPath}: ${result.stderr || result.stdout || "tar failed"}`);
+  }
 }
 
 function parseEspImage(buffer) {
@@ -200,7 +256,7 @@ function summarize(strings) {
   return {
     endpoints: uniqueText(focused, /^(GET|POST) /),
     responseFields: uniqueText(focused, /^(responsetag|rec_behavior|behavior_paras|pre_animation|post_animation|post_behavior|animation_name|queryText|resultCode)$/),
-    behaviors: uniqueText(focused, /^(ability_|interact_|chatgpt_)/),
+    behaviors: uniqueText(focused, /^(ability_|interact_|chatgpt_|function_|behavior_|voice_)/),
     animations: uniqueText(focused, /^(aibi_|animal_|chatgpt_|food_|interact_|multi_|pirate_|setting_|sing_|voice__)/),
     headers: uniqueText(focused, /^(Authorization|Secret|Connection|Keep-Alive|Host|Content-Type)/),
     focused,
@@ -212,20 +268,77 @@ function uniqueText(entries, pattern) {
 }
 
 function disassemble(segmentPath, loadAddress) {
-  const result = spawnSync("xtensa-lx106-elf-objdump", [
-    "-D",
-    "-b",
+  const tools = findAnalysisTools();
+  if (!tools.objdump || !tools.objcopy) {
+    console.warn(`objdump skipped for ${path.basename(segmentPath)}: ESP32-S3 analysis tools were not found. Run npm run setup.`);
+    return "";
+  }
+
+  const elfPath = segmentPath.replace(/\.bin$/i, ".elf");
+  const wrap = spawnSync(tools.objcopy, [
+    "-I",
     "binary",
-    "-m",
+    "-O",
+    "elf32-xtensa-le",
+    "-B",
     "xtensa",
-    `--adjust-vma=0x${loadAddress.toString(16)}`,
+    `--change-addresses=0x${loadAddress.toString(16)}`,
     segmentPath,
+    elfPath,
+  ], { encoding: "utf8" });
+  if (wrap.error || wrap.status !== 0) {
+    console.warn(`objcopy skipped for ${path.basename(segmentPath)}: ${wrap.error?.message || wrap.stderr || wrap.stdout || `exit ${wrap.status}`}`);
+    return "";
+  }
+
+  const result = spawnSync(tools.objdump, [
+    "-D",
+    elfPath,
   ], { encoding: "utf8", maxBuffer: 1024 * 1024 * 128 });
   if (result.error) {
     console.warn(`objdump skipped for ${path.basename(segmentPath)}: ${result.error.message}`);
     return "";
   }
+  if (result.status !== 0) {
+    console.warn(`objdump skipped for ${path.basename(segmentPath)}: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+    return "";
+  }
   return `${result.stdout}${result.stderr}`;
+}
+
+function findAnalysisTools() {
+  const toolchainBin = path.resolve(".tools/espressif/xtensa-esp32s3-elf/bin");
+  return {
+    objdump: findTool("objdump", [
+      process.env.AIBI_OBJDUMP,
+      path.join(toolchainBin, "xtensa-esp32s3-elf-objdump.exe"),
+      "xtensa-esp32s3-elf-objdump",
+      "xtensa-esp32-elf-objdump",
+      "xtensa-lx106-elf-objdump",
+    ]),
+    objcopy: findTool("objcopy", [
+      process.env.AIBI_OBJCOPY,
+      path.join(toolchainBin, "xtensa-esp32s3-elf-objcopy.exe"),
+      "xtensa-esp32s3-elf-objcopy",
+      "xtensa-esp32-elf-objcopy",
+      "xtensa-lx106-elf-objcopy",
+    ]),
+  };
+}
+
+function findTool(_name, candidates) {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.includes(path.sep) || candidate.endsWith(".exe")) {
+      if (fs.existsSync(candidate)) return candidate;
+      continue;
+    }
+    const command = process.platform === "win32" ? "where.exe" : "which";
+    const result = spawnSync(command, [candidate], { encoding: "utf8" });
+    const found = result.stdout?.split(/\r?\n/).find(Boolean);
+    if (result.status === 0 && found) return found.trim();
+  }
+  return "";
 }
 
 function writeStrings(filePath, entries) {
